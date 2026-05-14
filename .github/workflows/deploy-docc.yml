@@ -1,0 +1,381 @@
+name: Deploy DocC Documentation
+# Reusable workflow: build Swift DocC documentation with the canonical
+# Apple swift-docc-render renderer and deploy it to GitHub Pages.
+#
+# Build paths:
+#   spm  — `swift package generate-documentation` via swift-docc-plugin
+#   xcodebuild — `xcodebuild docbuild` (required for iOS-only packages)
+#   auto (default) — uses spm when Package.swift is present, otherwise
+#                    falls back to xcodebuild.
+#
+# Renderer: by default the workflow checks out and builds
+# `swiftlang/swift-docc-render` at the pinned ref below, giving every
+# caller the canonical Apple-styled DocC site. To swap in a fork (e.g.
+# the internal Mermaid-supporting one), override `docc-render-repo` and
+# `docc-render-ref`. The repo must be publicly accessible, or pass
+# `swift-pm-auth-token` for private access.
+#
+# Package.swift requirement (SPM path only):
+#   The caller's Package.swift must include the swift-docc-plugin dependency:
+#     .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"),
+#   The workflow does not auto-inject this — without it, `swift package
+#   generate-documentation` fails with "Unknown subcommand or plugin name".
+#
+# Required caller permissions:
+#   contents: read
+#   pages: write
+#   id-token: write
+#
+# Minimal caller example:
+#
+#   jobs:
+#     docs:
+#       uses: happitec-inc/public-actions/.github/workflows/deploy-docc.yml@main
+#       permissions:
+#         contents: read
+#         pages: write
+#         id-token: write
+#       with:
+#         target: MyLibrary
+#         hosting-base-path: my-library
+#         runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
+#
+# Full example with Mermaid renderer fork + private SPM deps:
+#
+#   jobs:
+#     docs:
+#       uses: happitec-inc/public-actions/.github/workflows/deploy-docc.yml@main
+#       permissions:
+#         contents: read
+#         pages: write
+#         id-token: write
+#       with:
+#         target: MyLibrary
+#         hosting-base-path: my-library
+#         runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
+#         docc-render-repo: your-org/swift-docc-render-mermaid
+#         docc-render-ref: main
+#         sibling-repos: |
+#           your-org/private-dep:../private-dep
+#       secrets:
+#         swift-pm-auth-token: ${{ secrets.MY_GITHUB_PAT }}
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: 'Swift target or Xcode scheme name for DocC generation'
+        required: true
+        type: string
+      hosting-base-path:
+        description: 'Base path for static hosting (e.g. my-library). Must match the GitHub Pages base path.'
+        required: true
+        type: string
+      runner:
+        description: |
+          Runner label as a JSON array string. Recommended caller pattern is
+          documented in the README — pass vars.RUNNER_MACOS with a JSON-array
+          fallback, e.g. ["macos-26"] or ["self-hosted","macos","arm64"].
+          Defaults to ["macos-26"] when omitted.
+        required: false
+        default: '["macos-26"]'
+        type: string
+      og-title:
+        description: 'OG meta title (e.g. "MyLibrary — Documentation")'
+        required: false
+        default: ''
+        type: string
+      og-description:
+        description: 'OG meta description'
+        required: false
+        default: ''
+        type: string
+      package-dir:
+        description: 'Directory containing Package.swift or .xcodeproj (default: repo root)'
+        required: false
+        default: '.'
+        type: string
+      build-method:
+        description: 'Build method: "auto" (default), "spm", or "xcodebuild". Use xcodebuild for iOS-only packages.'
+        required: false
+        default: 'auto'
+        type: string
+      destination:
+        description: 'xcodebuild destination (default: generic/platform=macOS). Used when the xcodebuild path is active.'
+        required: false
+        default: 'generic/platform=macOS'
+        type: string
+      docc-timeout-minutes-spm:
+        description: 'Per-step timeout (minutes) for the swift-docc-plugin path. Override for repos with long cold-cache builds.'
+        required: false
+        default: 30
+        type: number
+      docc-timeout-minutes-xcodebuild:
+        description: 'Per-step timeout (minutes) for the xcodebuild docbuild path. Override for repos with long cold-cache builds.'
+        required: false
+        default: 45
+        type: number
+      docc-render-repo:
+        description: |
+          owner/repo of the swift-docc-render renderer to build and use. Defaults
+          to the canonical Apple `swiftlang/swift-docc-render`. Override with a
+          fork (e.g. an internal Mermaid-supporting one) to swap renderers.
+        required: false
+        default: 'swiftlang/swift-docc-render'
+        type: string
+      docc-render-ref:
+        description: |
+          Branch/tag/SHA of docc-render-repo to check out. Defaults to
+          `release/6.4.x`, the most recent release branch of swiftlang/swift-docc-render
+          as of this workflow's last update. Override to track a different release.
+        required: false
+        default: 'release/6.4.x'
+        type: string
+      sibling-repos:
+        description: |
+          Newline-delimited list of sibling repos to check out before building, in
+          the format `owner/repo:relative-path` (path relative to GITHUB_WORKSPACE).
+          Use when Package.swift has local `path:` dependencies that must be present
+          on the runner. Example:
+            your-org/dep-a:../dep-a
+            your-org/dep-b:../dep-b
+          Requires swift-pm-auth-token secret when repos are private.
+        required: false
+        default: ''
+        type: string
+    secrets:
+      swift-pm-auth-token:
+        description: |
+          Optional PAT for accessing private repositories (sibling repos, private
+          swift-docc-render fork). Not required when all dependencies are public.
+          Grant this token repo:read (or contents:read) access to every private
+          repo listed in sibling-repos and/or docc-render-repo.
+        required: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ${{ fromJson(inputs.runner) }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Checkout sibling repos (local path dependencies)
+        if: inputs.sibling-repos != ''
+        env:
+          PAT: ${{ secrets.swift-pm-auth-token }}
+          REPOS: ${{ inputs.sibling-repos }}
+        run: |
+          while IFS=: read -r repo path; do
+            [ -z "$repo" ] && continue
+            echo "Cloning $repo → $path"
+            if [ -n "$PAT" ]; then
+              git clone --depth 1 "https://x-access-token:${PAT}@github.com/${repo}.git" "${GITHUB_WORKSPACE}/${path}"
+            else
+              git clone --depth 1 "https://github.com/${repo}.git" "${GITHUB_WORKSPACE}/${path}"
+            fi
+          done <<< "$REPOS"
+
+      - name: Checkout swift-docc-render renderer
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.docc-render-repo }}
+          ref: ${{ inputs.docc-render-ref }}
+          fetch-depth: 1
+          path: swift-docc-render-fork
+          token: ${{ secrets.swift-pm-auth-token || github.token }}
+
+      - name: Cache swift-docc-render dist
+        id: docc-render-cache
+        uses: actions/cache@v5
+        with:
+          path: swift-docc-render-fork/dist
+          key: docc-render-dist-${{ inputs.docc-render-repo }}-${{ inputs.docc-render-ref }}-${{ hashFiles('swift-docc-render-fork/package-lock.json') }}
+
+      - name: Set up Node.js
+        if: steps.docc-render-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Build swift-docc-render
+        if: steps.docc-render-cache.outputs.cache-hit != 'true'
+        run: |
+          cd swift-docc-render-fork
+          npm install
+          npm run build
+
+      - name: Setup Xcode
+        uses: happitec-inc/public-actions/setup-xcode@main
+
+      # setup-git-pat is a no-op when pat is empty, so this is safe to run
+      # unconditionally — the caller only needs to wire up the secret if their
+      # Package.swift references private GitHub repos.
+      - name: Configure git for private SPM dependency clones
+        uses: happitec-inc/public-actions/setup-git-pat@main
+        with:
+          pat: ${{ secrets.swift-pm-auth-token }}
+
+      - name: Detect build method and generate documentation
+        env:
+          DOCC_HTML_DIR: ${{ format('{0}/swift-docc-render-fork/dist', github.workspace) }}
+          TARGET: ${{ inputs.target }}
+          HOSTING_BASE_PATH: ${{ inputs.hosting-base-path }}
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          BUILD_METHOD: ${{ inputs.build-method }}
+          DESTINATION: ${{ inputs.destination }}
+          DOCC_TIMEOUT_MINUTES_SPM: ${{ inputs.docc-timeout-minutes-spm }}
+          DOCC_TIMEOUT_MINUTES_XCODEBUILD: ${{ inputs.docc-timeout-minutes-xcodebuild }}
+        run: |
+          DOCS_OUT="${GITHUB_WORKSPACE}/docs"
+          cd "$PACKAGE_DIR"
+
+          # Validate build-method input
+          case "$BUILD_METHOD" in
+            auto|spm|xcodebuild) ;;
+            *) echo "Error: Invalid build-method '$BUILD_METHOD'. Must be auto, spm, or xcodebuild."; exit 1 ;;
+          esac
+
+          # Determine build method
+          USE_SPM=false
+          if [ "$BUILD_METHOD" = "spm" ]; then
+            USE_SPM=true
+          elif [ "$BUILD_METHOD" = "xcodebuild" ]; then
+            USE_SPM=false
+          elif [ -f Package.swift ]; then
+            USE_SPM=true
+          fi
+
+          # Convert silent hangs inside the doc-generation subprocess into a
+          # deterministic failure. macOS doesn't ship GNU `timeout` by default;
+          # coreutils provides `gtimeout`. Install via brew if neither is present;
+          # if brew is missing or install fails, run without a wrapper and let the
+          # GitHub Actions job timeout backstop.
+          SPM_TIMEOUT_SECS=$(( DOCC_TIMEOUT_MINUTES_SPM * 60 ))
+          XCB_TIMEOUT_SECS=$(( DOCC_TIMEOUT_MINUTES_XCODEBUILD * 60 ))
+
+          if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then
+              echo "Installing coreutils for gtimeout (hang fail-fast wrapper)..."
+              brew install coreutils || echo "::warning::brew install coreutils failed; running without timeout wrapper"
+            else
+              echo "::warning::brew not available and no timeout binary; running without timeout wrapper"
+            fi
+          fi
+          if command -v timeout >/dev/null 2>&1; then
+            TIMEOUT_BIN="timeout"
+          elif command -v gtimeout >/dev/null 2>&1; then
+            TIMEOUT_BIN="gtimeout"
+          else
+            TIMEOUT_BIN=""
+          fi
+
+          if [ "$USE_SPM" = "true" ]; then
+            echo "Using swift-docc-plugin${TIMEOUT_BIN:+ (timeout ${SPM_TIMEOUT_SECS}s via $TIMEOUT_BIN)}"
+            ${TIMEOUT_BIN:+$TIMEOUT_BIN $SPM_TIMEOUT_SECS} swift package \
+              --allow-writing-to-directory "$DOCS_OUT" \
+              generate-documentation \
+              --target "$TARGET" \
+              --output-path "$DOCS_OUT" \
+              --transform-for-static-hosting \
+              --hosting-base-path "$HOSTING_BASE_PATH"
+          else
+            echo "Using xcodebuild docbuild (destination: $DESTINATION${TIMEOUT_BIN:+, timeout ${XCB_TIMEOUT_SECS}s via $TIMEOUT_BIN})"
+            XCODE_PROJECT=$(ls -d *.xcodeproj 2>/dev/null | head -1)
+            XCODE_WORKSPACE=$(ls -d *.xcworkspace 2>/dev/null | head -1)
+
+            if [ -n "$XCODE_WORKSPACE" ]; then
+              echo "Using workspace: $XCODE_WORKSPACE"
+              ${TIMEOUT_BIN:+$TIMEOUT_BIN $XCB_TIMEOUT_SECS} xcodebuild docbuild \
+                -workspace "$XCODE_WORKSPACE" \
+                -scheme "$TARGET" \
+                -destination "$DESTINATION" \
+                -derivedDataPath ./DerivedData \
+                -quiet
+            elif [ -n "$XCODE_PROJECT" ]; then
+              echo "Using project: $XCODE_PROJECT"
+              ${TIMEOUT_BIN:+$TIMEOUT_BIN $XCB_TIMEOUT_SECS} xcodebuild docbuild \
+                -project "$XCODE_PROJECT" \
+                -scheme "$TARGET" \
+                -destination "$DESTINATION" \
+                -derivedDataPath ./DerivedData \
+                -quiet
+            elif [ -f Package.swift ]; then
+              echo "Using xcodebuild with Package.swift (no project/workspace)"
+              ${TIMEOUT_BIN:+$TIMEOUT_BIN $XCB_TIMEOUT_SECS} xcodebuild docbuild \
+                -scheme "$TARGET" \
+                -destination "$DESTINATION" \
+                -derivedDataPath ./DerivedData \
+                -quiet
+            else
+              echo "Error: No Package.swift, .xcodeproj, or .xcworkspace found"
+              exit 1
+            fi
+
+            ARCHIVE=$(find ./DerivedData -name "${TARGET}.doccarchive" | head -1)
+            [ -z "$ARCHIVE" ] && ARCHIVE=$(find ./DerivedData -name "*.doccarchive" | head -1)
+            xcrun docc process-archive transform-for-static-hosting "$ARCHIVE" \
+              --output-path "$DOCS_OUT" \
+              --hosting-base-path "$HOSTING_BASE_PATH"
+          fi
+
+      - name: Add root redirect
+        if: inputs.og-title != '' || inputs.og-description != ''
+        env:
+          TARGET_LOWER: ${{ inputs.target }}
+          OG_TITLE: ${{ inputs.og-title }}
+          OG_DESCRIPTION: ${{ inputs.og-description }}
+          HOSTING_BASE_PATH: ${{ inputs.hosting-base-path }}
+        run: |
+          TARGET_LC=$(echo "$TARGET_LOWER" | tr '[:upper:]' '[:lower:]' | tr '-' '_')
+          cat > ./docs/index.html <<REDIRECT_EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="0; url=documentation/${TARGET_LC}/">
+            <link rel="canonical" href="documentation/${TARGET_LC}/">
+            <meta property="og:title" content="${OG_TITLE}">
+            <meta property="og:description" content="${OG_DESCRIPTION}">
+            <meta property="og:type" content="website">
+            <meta name="twitter:card" content="summary_large_image">
+            <meta name="twitter:title" content="${OG_TITLE}">
+            <meta name="twitter:description" content="${OG_DESCRIPTION}">
+          </head>
+          <body>
+            <a href="documentation/${TARGET_LC}/">Redirecting…</a>
+          </body>
+          </html>
+          REDIRECT_EOF
+
+      - name: Add minimal root redirect (no OG meta)
+        if: inputs.og-title == '' && inputs.og-description == ''
+        env:
+          TARGET_LOWER: ${{ inputs.target }}
+        run: |
+          TARGET_LC=$(echo "$TARGET_LOWER" | tr '[:upper:]' '[:lower:]' | tr '-' '_')
+          cat > ./docs/index.html <<REDIRECT_EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="0; url=documentation/${TARGET_LC}/">
+            <link rel="canonical" href="documentation/${TARGET_LC}/">
+          </head>
+          <body>
+            <a href="documentation/${TARGET_LC}/">Redirecting…</a>
+          </body>
+          </html>
+          REDIRECT_EOF
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

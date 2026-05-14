@@ -1,0 +1,50 @@
+name: 'Setup git PAT for private repo access'
+description: |
+  Configures a global git insteadOf rewrite so subprocess git clones of
+  https://<host>/ URLs authenticate using the supplied token.
+
+  Useful when Package.swift or other tooling resolves private Swift package
+  dependencies via plain `git clone` (e.g. SPM on runners with no credential
+  helper configured). Passing an empty `pat` is a no-op, so callers can
+  always invoke this action unconditionally.
+
+  NOTE: This action mutates the global git config on the runner. It is safe
+  on ephemeral (GitHub-hosted or Tart VM) runners because the config is
+  discarded when the runner terminates. Do NOT use on long-lived self-hosted
+  runners without adding an explicit cleanup step:
+    git config --global --unset-all url.https://x-access-token:*.insteadOf
+
+  PAT requirement: The token passed to `pat` must have read access to every
+  private repository that SPM needs to resolve. `secrets.GITHUB_TOKEN` is
+  scoped to the current repo and cannot read other repos.
+
+  Usage: see the README for a full caller example. Pass `pat` wired to a
+  PAT secret with read access to private dependencies, and optionally
+  override `host` (defaults to github.com).
+
+inputs:
+  pat:
+    description: >
+      Personal access token with read access to private dependencies.
+      Empty value is a no-op — the action exits successfully without
+      configuring anything.
+    required: false
+    default: ''
+  host:
+    description: 'Hostname to rewrite (defaults to github.com).'
+    required: false
+    default: 'github.com'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure git insteadOf rewrite
+      if: inputs.pat != ''
+      shell: bash
+      env:
+        PAT: ${{ inputs.pat }}
+        HOST: ${{ inputs.host }}
+      run: |
+        git config --global \
+          "url.https://x-access-token:${PAT}@${HOST}/.insteadOf" \
+          "https://${HOST}/"

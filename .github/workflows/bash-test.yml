@@ -1,0 +1,75 @@
+name: Bash Test
+# Reusable workflow: run a bash test script against the caller repo.
+#
+# Designed for shell-tool repos (gh-filter and similar) that ship a single
+# test harness invoked as `./test/test.sh` and exit-0 on all-pass. The
+# workflow checks out the caller repo, makes the script executable if
+# needed, and runs it. The script's exit code is the job's exit code.
+#
+# Caller permissions required:
+#   contents: read
+#
+# ── Example (default Linux runner, default ./test/test.sh) ──────────────
+#   jobs:
+#     test:
+#       uses: happitec-inc/public-actions/.github/workflows/bash-test.yml@main
+#       with:
+#         runner: ${{ vars.RUNNER_LINUX || '["ubuntu-latest"]' }}
+#
+# ── Example (macOS runner — bash 3.2, custom script path) ───────────────
+#   jobs:
+#     test:
+#       uses: happitec-inc/public-actions/.github/workflows/bash-test.yml@main
+#       with:
+#         runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
+#         script: ./scripts/run-tests.sh
+#
+# ── Note on runner choice ───────────────────────────────────────────────
+#   Default is Linux — fast, cheap, and runs modern bash (4.x+ on
+#   ubuntu-latest). Pass a macOS runner when the script under test exercises
+#   bash 3.2 specifically (empty-array + set-u edge cases, etc.) — that's
+#   what macOS ships and what catches those regressions.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: >
+          Runner label as a JSON array string. Recommended caller pattern
+          is to pass vars.RUNNER_LINUX or vars.RUNNER_MACOS with a JSON-array
+          fallback. Defaults to ["ubuntu-latest"] when omitted.
+        required: false
+        default: '["ubuntu-latest"]'
+        type: string
+      script:
+        description: >
+          Path to the bash test script to run, relative to the repo root.
+          Defaults to ./test/test.sh, matching the shell-tool convention.
+        required: false
+        default: './test/test.sh'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ${{ fromJson(inputs.runner) }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Run test script
+        env:
+          SCRIPT: ${{ inputs.script }}
+        run: |
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::Test script not found at $SCRIPT"
+            exit 1
+          fi
+          if [ ! -x "$SCRIPT" ]; then
+            chmod +x "$SCRIPT"
+          fi
+          "$SCRIPT"

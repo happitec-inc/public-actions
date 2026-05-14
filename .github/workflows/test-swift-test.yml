@@ -1,0 +1,30 @@
+name: Test Swift Test Workflow
+# Exercises the reusable swift-test workflow. Runs against this repo's own
+# Package.swift (SPM mode) and, when a scheme is present, the xcodebuild path.
+# Triggered manually; intended as a smoke-test for workflow changes.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "test-swift-test"
+  cancel-in-progress: true
+
+jobs:
+  # SPM path: swift test with no extra inputs.
+  #
+  # The runner: line demonstrates the recommended caller pattern — pick up an
+  # org-level RUNNER_MACOS variable if set, otherwise fall back to macos-26.
+  #
+  # IMPORTANT: vars.RUNNER_MACOS must hold a **JSON-array string** (e.g.
+  # '["macos-26"]' or '["self-hosted","macos","arm64"]'), not a bare label.
+  # The reusable workflow runs the value through fromJson(), so a bare string
+  # like "macos-26" will fail the JSON parse step.
+  # See the repo README for the full convention.
+  spm:
+    uses: ./.github/workflows/swift-test.yml
+    with:
+      runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}

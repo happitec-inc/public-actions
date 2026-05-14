@@ -1,0 +1,112 @@
+name: Test DocC Build
+# Validates DocC documentation generation tooling on a macOS runner.
+# Intended as a smoke test for the deploy-docc workflow's prerequisites
+# (Xcode, swift-docc-plugin, xcodebuild docbuild, Node.js).
+#
+# Run this manually after modifying setup-xcode or the DocC build logic.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label as a JSON array string. Defaults to ["macos-26"].'
+        required: false
+        default: '["macos-26"]'
+        type: string
+      xcode-version:
+        description: 'Xcode major version'
+        required: false
+        default: '26'
+        type: string
+
+jobs:
+  test-docc:
+    name: DocC smoke test
+    runs-on: ${{ fromJson(inputs.runner) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: ./setup-xcode
+        with:
+          xcode-version: ${{ inputs.xcode-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate Node.js
+        run: |
+          echo "--- Node ---"
+          node --version
+          echo "--- npm ---"
+          npm --version
+
+      - name: Test swift-docc-plugin documentation generation
+        run: |
+          TEST_DIR=$(mktemp -d)
+          trap 'rm -rf "$TEST_DIR"' EXIT
+          cd "$TEST_DIR"
+
+          swift package init --name DocCTest --type library
+
+          mkdir -p Sources/DocCTest/DocCTest.docc
+          printf '# ``DocCTest``\n\nA test package for validating DocC builds.\n\n## Overview\n\nThis package exists only to test that DocC documentation generation works.\n' > Sources/DocCTest/DocCTest.docc/DocCTest.md
+
+          printf '/// A test struct for DocC.\npublic struct DocCTest {\n    /// Creates a new instance.\n    public init() {}\n}\n' > Sources/DocCTest/DocCTest.swift
+
+          printf '// swift-tools-version: 6.0\nimport PackageDescription\nlet package = Package(\n    name: "DocCTest",\n    products: [\n        .library(name: "DocCTest", targets: ["DocCTest"]),\n    ],\n    dependencies: [\n        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.0.0"),\n    ],\n    targets: [\n        .target(name: "DocCTest"),\n    ]\n)\n' > Package.swift
+
+          swift package resolve
+          swift package \
+            --allow-writing-to-directory ./docs \
+            generate-documentation \
+            --target DocCTest \
+            --output-path ./docs \
+            --transform-for-static-hosting \
+            --hosting-base-path docc-test
+
+          echo ""
+          echo "DocC output:"
+          ls -la ./docs/ | head -10
+          echo ""
+          echo "DocC generation succeeded"
+
+      - name: Test xcodebuild docbuild
+        run: |
+          TEST_DIR=$(mktemp -d)
+          trap 'rm -rf "$TEST_DIR"' EXIT
+          cd "$TEST_DIR"
+
+          swift package init --name DocBuildTest --type library
+          printf '/// A test struct for xcodebuild docbuild.\npublic struct DocBuildTest {\n    /// Creates a new instance.\n    public init() {}\n}\n' > Sources/DocBuildTest/DocBuildTest.swift
+
+          xcodebuild docbuild \
+            -scheme DocBuildTest \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath ./DerivedData \
+            -quiet
+
+          ARCHIVE=$(find ./DerivedData -name "*.doccarchive" | head -1)
+          if [ -n "$ARCHIVE" ]; then
+            echo "DocC archive: $ARCHIVE"
+            echo "xcodebuild docbuild succeeded"
+          else
+            echo "Warning: No .doccarchive found"
+            ls -R ./DerivedData/Build/Products/ 2>/dev/null || true
+          fi
+
+      - name: Summary
+        run: |
+          echo "## DocC Build Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Xcode | $(xcodebuild -version | head -1) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Swift | $(swift --version 2>&1 | head -1) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Node.js | $(node --version) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| OS | $(sw_vers -productVersion) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Arch | $(uname -m) |" >> "$GITHUB_STEP_SUMMARY"

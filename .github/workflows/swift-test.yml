@@ -1,0 +1,299 @@
+name: Swift Test
+# Reusable workflow: build and test a Swift package or Xcode project on macOS.
+#
+# Supports three modes:
+#   1. SPM only — runs `swift test` against a Package.swift.
+#   2. xcodebuild test — runs `xcodebuild test -scheme <scheme>`.
+#   3. Multi-target — runs `swift test` and then additional build-only steps for
+#      iOS and/or macOS app targets that live outside the package (e.g. App/ sources
+#      under an Xcode project).
+#
+# Caller permissions required:
+#   contents: read
+#
+# ── Example: SPM-only repo ───────────────────────────────────────────────────
+#   jobs:
+#     test:
+#       uses: happitec-inc/public-actions/.github/workflows/swift-test.yml@main
+#       with:
+#         runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
+#
+# ── Example: xcodebuild test ─────────────────────────────────────────────────
+#   jobs:
+#     test:
+#       uses: happitec-inc/public-actions/.github/workflows/swift-test.yml@main
+#       with:
+#         runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
+#         scheme: MyAppTests
+#         destination: 'platform=macOS'
+#
+# ── Example: multi-target (SPM + iOS + macOS app builds) ────────────────────
+#   jobs:
+#     test:
+#       uses: happitec-inc/public-actions/.github/workflows/swift-test.yml@main
+#       with:
+#         runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
+#         scheme_ios: MyAppiOS
+#         scheme_macos: MyAppMac
+#         macos-development-team: "YOURTEAMID"
+#       secrets:
+#         macos-developer-id-p12-base64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+#         macos-developer-id-p12-password: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+#
+# ── Private SPM dependencies ─────────────────────────────────────────────────
+#   If your Package.swift references private GitHub repos, pass a token with
+#   read access to those repos via the `swift-pm-auth-token` secret. The
+#   workflow configures git credential storage so SPM can clone them.
+#   Without it, SPM will block indefinitely on the first private dependency.
+#
+#   jobs:
+#     test:
+#       uses: happitec-inc/public-actions/.github/workflows/swift-test.yml@main
+#       with:
+#         runner: ${{ vars.RUNNER_MACOS || '["macos-26"]' }}
+#       secrets:
+#         swift-pm-auth-token: ${{ secrets.MY_GITHUB_PAT }}
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: >
+          Runner label as a JSON array string. Recommended caller pattern is
+          documented in the README — pass vars.RUNNER_MACOS with a JSON-array
+          fallback, e.g. ["macos-26"] or ["self-hosted","macos","arm64"].
+          Defaults to ["macos-26"] when omitted.
+        required: false
+        default: '["macos-26"]'
+        type: string
+      scheme:
+        description: 'Xcode scheme to test. If set, uses xcodebuild test instead of swift test.'
+        required: false
+        default: ''
+        type: string
+      destination:
+        description: 'xcodebuild destination (only used when scheme is set).'
+        required: false
+        default: 'platform=macOS'
+        type: string
+      package-dir:
+        description: 'Directory containing Package.swift (default: repo root).'
+        required: false
+        default: '.'
+        type: string
+      env:
+        description: 'JSON object of environment variables to inject into the test step (e.g. {"USE_MOCKS":"1"}).'
+        required: false
+        default: '{}'
+        type: string
+      filter:
+        description: >
+          XCTest filter pattern for `swift test --filter <value>` (SPM mode only;
+          ignored when `scheme` is set — use xcodebuild's `-only-testing:` for that).
+        required: false
+        default: ''
+        type: string
+      scheme_ios:
+        description: |
+          iOS app scheme to build (build-only, no test runner). When set, runs:
+            xcodebuild build -scheme <value> -destination generic/platform=iOS Simulator
+          after the main test step. Use for repos with an iOS app target that swift test
+          does not compile (e.g. App/ sources under an Xcode project).
+        required: false
+        default: ''
+        type: string
+      scheme_macos:
+        description: |
+          macOS app scheme to build (build-only, no test runner). When set, runs:
+            xcodebuild build -scheme <value> -destination platform=macOS
+          after the main test step. Use for repos with a macOS app target that swift test
+          does not compile (e.g. App/ sources under an Xcode project).
+          Requires macos-developer-id-p12-base64 + macos-developer-id-p12-password secrets
+          so the runner can sign the build.
+        required: false
+        default: ''
+        type: string
+      macos-development-team:
+        description: >
+          Apple Developer Team ID (e.g. ABCDE12345). Passed as DEVELOPMENT_TEAM to
+          xcodebuild for the scheme_macos build so SPM dependency targets inherit the
+          team and can be signed.
+        required: false
+        default: ''
+        type: string
+      project:
+        description: >
+          Xcode project file to pass as -project to xcodebuild for scheme_ios and
+          scheme_macos builds (e.g. MyApp.xcodeproj). Required when the repo contains
+          both a Package.swift and an .xcodeproj and xcodebuild auto-discovers the
+          wrong workspace.
+        required: false
+        default: ''
+        type: string
+      skip-package-plugin-validation:
+        description: >
+          Pass -skipPackagePluginValidation to xcodebuild. Required for repos using
+          OpenAPIGenerator or other Swift package plugins on CI runners that have not
+          pre-approved the plugin.
+        required: false
+        default: false
+        type: boolean
+      xcode-version:
+        description: >
+          Xcode version to select via `xcode-select` before building (e.g. "16.2").
+          Leave empty to use the runner default.
+        required: false
+        default: ''
+        type: string
+    secrets:
+      swift-pm-auth-token:
+        description: >
+          Optional GitHub PAT (or other token) with read access to private repos
+          referenced in Package.swift. When provided, configures git credential
+          storage so SPM can clone private dependencies. Omit for all-public
+          dependency graphs.
+        required: false
+      macos-developer-id-p12-base64:
+        description: >
+          Base64-encoded Developer ID Application .p12 certificate for signing the
+          macOS app build (scheme_macos). Imported into a temporary keychain scoped
+          to the job. Required when scheme_macos is set.
+        required: false
+      macos-developer-id-p12-password:
+        description: 'Export password for macos-developer-id-p12-base64.'
+        required: false
+
+jobs:
+  test:
+    runs-on: ${{ fromJson(inputs.runner) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        if: inputs.xcode-version != ''
+        run: |
+          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_${{ inputs.xcode-version }}*.app" | head -1)
+          if [ -z "$XCODE_PATH" ]; then
+            XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode.app" | head -1)
+            echo "Xcode ${{ inputs.xcode-version }} not found; using runner default at $XCODE_PATH"
+          else
+            echo "Selecting Xcode at $XCODE_PATH"
+          fi
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      # If your Package.swift references private GitHub repos, pass
+      # `swift-pm-auth-token` as a secret. setup-git-pat installs an insteadOf
+      # rewrite so SPM can resolve those repos via HTTPS. An empty token is a
+      # no-op, so this step is safe to run unconditionally.
+      - name: Configure git for private SPM dependency clones
+        uses: happitec-inc/public-actions/setup-git-pat@main
+        with:
+          pat: ${{ secrets.swift-pm-auth-token }}
+
+      - name: Build and test
+        env:
+          SCHEME: ${{ inputs.scheme }}
+          DESTINATION: ${{ inputs.destination }}
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          FILTER: ${{ inputs.filter }}
+          _EXTRA_ENV: ${{ inputs.env }}
+          SKIP_PLUGIN_VALIDATION: ${{ inputs.skip-package-plugin-validation }}
+        run: |
+          # Export caller-provided environment variables (NUL-delimited to handle values with newlines)
+          if [ "$_EXTRA_ENV" != '{}' ] && [ -n "$_EXTRA_ENV" ]; then
+            while IFS='=' read -r -d '' key value; do
+              export "$key=$value"
+              echo "  env: $key=<set>"
+            done < <(echo "$_EXTRA_ENV" | python3 -c "
+          import sys, json
+          for k, v in json.load(sys.stdin).items():
+              sys.stdout.write(f'{k}={v}\0')
+          ")
+          fi
+
+          cd "$PACKAGE_DIR"
+          if [ -n "$SCHEME" ]; then
+            echo "Testing scheme: $SCHEME (destination: $DESTINATION)"
+            ARGS=(test -scheme "$SCHEME" -destination "$DESTINATION" -quiet)
+            [ "$SKIP_PLUGIN_VALIDATION" = "true" ] && ARGS+=(-skipPackagePluginValidation)
+            xcodebuild "${ARGS[@]}"
+          else
+            if [ -n "$FILTER" ]; then
+              echo "Running swift test --filter $FILTER"
+              swift test --filter "$FILTER"
+            else
+              echo "Running swift test"
+              swift test
+            fi
+          fi
+
+      - name: Generate Xcode project (xcodegen)
+        # Scope the lookup to the package-dir input (defaults to repo root).
+        # Using '**/project.yml' here was too greedy: it picked up project.yml
+        # under nested Example/ or sample subprojects, which is wrong — we only
+        # want to run xcodegen on the project the caller actually pointed us at.
+        if: hashFiles(format('{0}/project.yml', inputs.package-dir)) != ''
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+        run: |
+          which xcodegen || brew install xcodegen
+          cd "$PACKAGE_DIR"
+          xcodegen generate
+
+      - name: Build iOS app target
+        if: inputs.scheme_ios != ''
+        env:
+          SCHEME: ${{ inputs.scheme_ios }}
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          PROJECT: ${{ inputs.project }}
+          SKIP_PLUGIN_VALIDATION: ${{ inputs.skip-package-plugin-validation }}
+        run: |
+          cd "$PACKAGE_DIR"
+          echo "Building iOS scheme: $SCHEME"
+          ARGS=(build -scheme "$SCHEME" -destination "generic/platform=iOS Simulator" -quiet)
+          [ -n "$PROJECT" ] && ARGS+=(-project "$PROJECT")
+          [ "$SKIP_PLUGIN_VALIDATION" = "true" ] && ARGS+=(-skipPackagePluginValidation)
+          xcodebuild "${ARGS[@]}"
+
+      - name: Import Developer ID certificate for macOS build
+        if: inputs.scheme_macos != ''
+        env:
+          P12_BASE64: ${{ secrets.macos-developer-id-p12-base64 }}
+          P12_PASSWORD: ${{ secrets.macos-developer-id-p12-password }}
+        run: |
+          echo "$P12_BASE64" | base64 --decode > /tmp/swift-test-codesign.p12
+          security create-keychain -p "" /tmp/swift-test-build.keychain
+          security set-keychain-settings -lut 21600 /tmp/swift-test-build.keychain
+          security unlock-keychain -p "" /tmp/swift-test-build.keychain
+          security import /tmp/swift-test-codesign.p12 \
+            -k /tmp/swift-test-build.keychain \
+            -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security list-keychains -d user -s /tmp/swift-test-build.keychain $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" /tmp/swift-test-build.keychain
+          rm /tmp/swift-test-codesign.p12
+
+      - name: Build macOS app target
+        if: inputs.scheme_macos != ''
+        env:
+          SCHEME: ${{ inputs.scheme_macos }}
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          PROJECT: ${{ inputs.project }}
+          SKIP_PLUGIN_VALIDATION: ${{ inputs.skip-package-plugin-validation }}
+          DEVELOPMENT_TEAM: ${{ inputs.macos-development-team }}
+        run: |
+          cd "$PACKAGE_DIR"
+          echo "Building macOS scheme: $SCHEME"
+          ARGS=(build -scheme "$SCHEME" -destination "platform=macOS" -quiet)
+          [ -n "$PROJECT" ] && ARGS+=(-project "$PROJECT")
+          [ "$SKIP_PLUGIN_VALIDATION" = "true" ] && ARGS+=(-skipPackagePluginValidation)
+          SIGN_ARGS=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Developer ID Application")
+          [ -n "$DEVELOPMENT_TEAM" ] && SIGN_ARGS+=(DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM")
+          xcodebuild "${ARGS[@]}" "${SIGN_ARGS[@]}"
+
+      - name: Clean up macOS signing keychain
+        if: always() && inputs.scheme_macos != ''
+        run: |
+          security delete-keychain /tmp/swift-test-build.keychain 2>/dev/null || true

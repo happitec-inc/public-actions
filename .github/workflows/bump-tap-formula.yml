@@ -1,0 +1,293 @@
+name: Bump Tap Formula
+run-name: "Bump tap formula → ${{ inputs.formula || github.event.repository.name }} ${{ github.ref_name }}"
+
+# Reusable workflow for happitec-inc source repos to open a PR on
+# happitec-inc/homebrew-tap bumping the formula's `tag:` and `revision:`
+# pins to the just-pushed git tag.
+#
+# Caller usage (in a source repo, e.g. happitec-inc/dash-issues):
+#
+#   # .github/workflows/bump-tap.yml
+#   name: Bump Homebrew Tap
+#   on:
+#     push:
+#       tags: ['v*']
+#   permissions: {}
+#   jobs:
+#     bump:
+#       uses: happitec-inc/shared-actions/.github/workflows/bump-tap-formula.yml@main
+#       secrets: inherit
+#       with:
+#         runner: ${{ vars.RUNNER_LINUX }}
+#         # Optional: override formula name if it differs from the repo name.
+#         # formula: dash-issues
+#
+# Required org-level secrets (already used by switch-runners.yml):
+#   GH_COMPUTER_APP_ID       — happitec-computer App ID
+#   GH_COMPUTER_PRIVATE_KEY  — App private key (PEM)
+#
+# The App must be installed on both the caller repo (read) and on
+# happitec-inc/homebrew-tap (Contents: Write, Pull requests: Write).
+#
+# Assumptions about the target formula:
+#   - Lives at Formula/<formula>.rb in happitec-inc/homebrew-tap.
+#   - Already exists. Initial registration is administrivia's job; this
+#     workflow only bumps existing pins.
+#   - Has a single `url ... tag: "v...", revision: "..."` block (the
+#     standard tap convention). Resources or multiple url blocks are
+#     not supported.
+#   - Has a top-level `version "..."` declaration. The workflow rewrites
+#     this in lockstep with `tag:` so that `brew info` and `Cellar/<name>/X.Y.Z`
+#     match the actual installed source. A formula without `version "..."`
+#     is allowed but the workflow logs a notice — Homebrew will infer
+#     version from the tag in that case.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'Runner label (JSON string). Caller must pass vars.RUNNER_LINUX so this honors the org-level switch-runners.yml flip.'
+        required: true
+        type: string
+      formula:
+        description: 'Formula name (filename without .rb). Defaults to the caller repo name.'
+        required: false
+        default: ''
+        type: string
+      tap-repo:
+        description: 'Tap repo in owner/name form. Default: happitec-inc/homebrew-tap.'
+        required: false
+        default: 'happitec-inc/homebrew-tap'
+        type: string
+
+permissions: {}
+
+concurrency:
+  # One bump per (formula, tag) at a time; serialize re-runs of the same
+  # tag push but allow independent formulas to bump in parallel.
+  group: bump-tap-formula-${{ inputs.formula || github.event.repository.name }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ${{ fromJson(inputs.runner) }}
+    timeout-minutes: 5
+    steps:
+      - name: Validate trigger
+        env:
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::This workflow must be called from a tag push (got ref_type=$REF_TYPE, ref=$REF)."
+            exit 1
+          fi
+          case "$REF" in
+            refs/tags/v*) ;;
+            *) echo "::error::Tag must start with 'v' (got $REF)."; exit 1 ;;
+          esac
+
+      - name: Resolve inputs
+        id: vars
+        env:
+          INPUT_FORMULA: ${{ inputs.formula }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          TAP_REPO: ${{ inputs.tap-repo }}
+        run: |
+          FORMULA="${INPUT_FORMULA:-$REPO_NAME}"
+          BRANCH="bump/${FORMULA}-${TAG}"
+          {
+            echo "formula=$FORMULA"
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "branch=$BRANCH"
+            echo "tap_repo=$TAP_REPO"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Bump request"
+            echo ""
+            echo "- Formula: \`$FORMULA\`"
+            echo "- Tag: \`$TAG\`"
+            echo "- Revision: \`$SHA\`"
+            echo "- Tap: \`$TAP_REPO\`"
+            echo "- Branch: \`$BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_COMPUTER_APP_ID }}
+          private-key: ${{ secrets.GH_COMPUTER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Token is owner-scoped (covers all repos the App is installed on).
+          # Audit boundary is the App identity, not the per-token repo scope —
+          # consistent with switch-runners.yml.
+
+      - name: Checkout tap
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.vars.outputs.tap_repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+          fetch-depth: 0
+
+      - name: Verify formula exists and rewrite pins
+        id: rewrite
+        env:
+          FORMULA: ${{ steps.vars.outputs.formula }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          SHA: ${{ steps.vars.outputs.sha }}
+        run: |
+          FORMULA_PATH="tap/Formula/${FORMULA}.rb"
+          if [ ! -f "$FORMULA_PATH" ]; then
+            echo "::error::Formula not found at $FORMULA_PATH. Initial registration must happen before this workflow can bump."
+            exit 1
+          fi
+
+          # Capture the current tag/revision/version for the PR body and idempotency check.
+          # NEW_VERSION is derived from TAG by stripping the leading 'v' (validated above).
+          NEW_VERSION="${TAG#v}"
+          OLD_TAG=$(grep -E '^\s*tag:\s+"v' "$FORMULA_PATH" | head -1 | sed -E 's/.*tag:\s+"([^"]+)".*/\1/')
+          OLD_SHA=$(grep -E '^\s*revision:\s+"' "$FORMULA_PATH" | head -1 | sed -E 's/.*revision:\s+"([^"]+)".*/\1/')
+          OLD_VERSION=$(grep -E '^\s*version\s+"' "$FORMULA_PATH" | head -1 | sed -E 's/.*version\s+"([^"]+)".*/\1/')
+
+          if [ -z "$OLD_TAG" ] || [ -z "$OLD_SHA" ]; then
+            echo "::error::Could not parse existing tag: / revision: lines in $FORMULA_PATH."
+            echo "Found tag='$OLD_TAG' revision='$OLD_SHA'."
+            exit 1
+          fi
+          # OLD_VERSION absent is allowed (Homebrew can infer from tag), but warn.
+          if [ -z "$OLD_VERSION" ]; then
+            echo "::notice::No \`version \"...\"\` line found in $FORMULA_PATH; Homebrew will infer from tag. Workflow will not write a version line where none exists."
+          fi
+
+          if [ "$OLD_TAG" = "$TAG" ] && [ "$OLD_SHA" = "$SHA" ] && { [ -z "$OLD_VERSION" ] || [ "$OLD_VERSION" = "$NEW_VERSION" ]; }; then
+            echo "Formula already pinned to $TAG @ $SHA (version $NEW_VERSION) — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Surgical sed: only the first matching line in the file. Each
+          # formula in this tap has exactly one tag: / revision: pair (no
+          # resources, no multi-url blocks) and at most one `version "..."`
+          # line, enforced by the convention.
+          python3 - "$FORMULA_PATH" "$TAG" "$SHA" "$NEW_VERSION" <<'PY'
+          import re, sys
+          path, new_tag, new_sha, new_version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          with open(path, 'r', encoding='utf-8') as f:
+              src = f.read()
+          # Replace only the first occurrence of each.
+          new_src, n_tag = re.subn(r'(\btag:\s+")v[^"]+(")', rf'\g<1>{new_tag}\g<2>', src, count=1)
+          new_src, n_sha = re.subn(r'(\brevision:\s+")[0-9a-f]{7,40}(")', rf'\g<1>{new_sha}\g<2>', new_src, count=1)
+          # Version line is optional — Homebrew infers from tag if absent.
+          # Match `version "0.1.2"` but NOT keyword forms (e.g. `tag: "..."`).
+          new_src, n_ver = re.subn(
+              r'(^\s*version\s+")[^"]+(")',
+              rf'\g<1>{new_version}\g<2>',
+              new_src,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if n_tag != 1 or n_sha != 1:
+              sys.stderr.write(f"Expected exactly 1 tag and 1 revision sub; got tag={n_tag} sha={n_sha}\n")
+              sys.exit(2)
+          if n_ver not in (0, 1):
+              sys.stderr.write(f"Expected 0 or 1 version subs; got {n_ver}\n")
+              sys.exit(2)
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(new_src)
+          PY
+
+          {
+            echo "old_tag=$OLD_TAG"
+            echo "old_sha=$OLD_SHA"
+            echo "old_version=$OLD_VERSION"
+            echo "new_version=$NEW_VERSION"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Diff:"
+          (cd tap && git --no-pager diff "Formula/${FORMULA}.rb")
+
+      - name: Create branch, commit, push, open PR
+        if: steps.rewrite.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FORMULA: ${{ steps.vars.outputs.formula }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          SHA: ${{ steps.vars.outputs.sha }}
+          BRANCH: ${{ steps.vars.outputs.branch }}
+          OLD_TAG: ${{ steps.rewrite.outputs.old_tag }}
+          OLD_SHA: ${{ steps.rewrite.outputs.old_sha }}
+          OLD_VERSION: ${{ steps.rewrite.outputs.old_version }}
+          NEW_VERSION: ${{ steps.rewrite.outputs.new_version }}
+          TAP_REPO: ${{ steps.vars.outputs.tap_repo }}
+          SOURCE_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd tap
+          git config user.name  "happitec-computer[bot]"
+          git config user.email "232697186+happitec-computer[bot]@users.noreply.github.com"
+
+          # Re-runs land on the same branch; force-push so the PR refreshes.
+          git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+          git add "Formula/${FORMULA}.rb"
+          git commit -m "${FORMULA}: bump to ${TAG}
+
+          Triggered by tag push on ${SOURCE_REPO}.
+
+          Old: ${OLD_TAG} @ ${OLD_SHA} (version ${OLD_VERSION:-<none>})
+          New: ${TAG} @ ${SHA} (version ${NEW_VERSION})
+
+          Run: ${RUN_URL}
+          "
+          git push --force-with-lease origin "$BRANCH"
+
+          # Open PR if missing; otherwise PR auto-tracks the new commits.
+          EXISTING=$(gh pr list --repo "$TAP_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || true)
+          if [ -z "$EXISTING" ]; then
+            gh pr create \
+              --repo "$TAP_REPO" \
+              --base main \
+              --head "$BRANCH" \
+              --title "${FORMULA}: bump to ${TAG}" \
+              --body "$(cat <<EOF
+          ## Summary
+
+          Automated bump of \`Formula/${FORMULA}.rb\` from \`${OLD_TAG}\` to \`${TAG}\`.
+
+          - **Old**: \`${OLD_TAG}\` @ \`${OLD_SHA}\` (version \`${OLD_VERSION:-<none>}\`)
+          - **New**: \`${TAG}\` @ \`${SHA}\` (version \`${NEW_VERSION}\`)
+          - **Source**: ${SOURCE_REPO}
+          - **Trigger**: tag push on \`${TAG}\`
+          - **Workflow run**: ${RUN_URL}
+
+          ## How this happened
+
+          The source repo's \`bump-tap.yml\` workflow called \`happitec-inc/shared-actions/.github/workflows/bump-tap-formula.yml\` after a tag matching \`v*\` was pushed.
+
+          ## Reviewer checklist
+
+          - [ ] \`${TAG}\` is a real tag in the source repo
+          - [ ] \`${SHA}\` is the commit the tag points at
+          - [ ] No formula structure changes are needed for this version (e.g. new dependency, changed install steps)
+          EOF
+          )"
+          else
+            echo "PR #$EXISTING already exists for $BRANCH; updated with new commits."
+            gh pr comment "$EXISTING" --repo "$TAP_REPO" --body "Refreshed by re-run: \`${TAG}\` @ \`${SHA}\`. Run: ${RUN_URL}"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          SKIP: ${{ steps.rewrite.outputs.skip }}
+          FORMULA: ${{ steps.vars.outputs.formula }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          if [ "$SKIP" = "true" ]; then
+            echo "Formula \`${FORMULA}\` already at \`${TAG}\` — no PR opened." >> "$GITHUB_STEP_SUMMARY"
+          fi

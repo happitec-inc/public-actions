@@ -1,0 +1,63 @@
+name: 'Setup Xcode'
+description: |
+  Select a specific Xcode version on a macOS runner and verify the toolchain.
+  Works on both GitHub-hosted and self-hosted macOS runners.
+
+  Usage:
+    - uses: happitec-inc/public-actions/setup-xcode@main
+      with:
+        xcode-version: '26'  # optional, defaults to '26'
+
+  The action scans /Applications for a matching Xcode_<version>*.app, falls
+  back to the default Xcode.app if no versioned copy is present, and verifies
+  the selection by printing xcodebuild, Swift, and SDK versions.
+
+inputs:
+  xcode-version:
+    description: 'Xcode major version to select (e.g. "26"). Matches Xcode_<version>*.app via glob.'
+    required: false
+    default: '26'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Select Xcode
+      shell: bash
+      run: |
+        VERSION="${{ inputs.xcode-version }}"
+
+        # Find the matching Xcode installation
+        XCODE_APP=$(ls -d /Applications/Xcode_${VERSION}*.app 2>/dev/null | sort -V | tail -1)
+
+        if [ -z "$XCODE_APP" ]; then
+          # Fall back to default Xcode.app if no versioned app found
+          if [ -d /Applications/Xcode.app ]; then
+            XCODE_APP="/Applications/Xcode.app"
+            echo "::warning::No Xcode_${VERSION}*.app found, falling back to $XCODE_APP"
+          else
+            echo "Error: No Xcode installation found matching version $VERSION"
+            ls /Applications/Xcode*.app 2>/dev/null || echo "No Xcode apps in /Applications"
+            exit 1
+          fi
+        fi
+
+        echo "Selecting $XCODE_APP"
+        sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
+    - name: Verify Xcode
+      shell: bash
+      run: |
+        echo "=== Xcode ==="
+        xcodebuild -version
+        echo ""
+        echo "=== Developer Dir ==="
+        xcode-select -p
+        echo ""
+        echo "=== Swift ==="
+        swift --version
+        echo ""
+        echo "=== Available Simulators ==="
+        xcrun simctl list runtimes
+        echo ""
+        echo "=== SDK Versions ==="
+        xcodebuild -showsdks 2>/dev/null | grep -E 'iOS|macOS' | head -10
