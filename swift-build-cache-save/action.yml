@@ -1,0 +1,37 @@
+name: Save Swift Build Cache
+description: |
+  Saves the .build directory after a Swift build. Fixes file ownership
+  when the build ran inside Docker (files owned by root), then saves
+  the cache. Runs even if later steps fail (if: always()).
+
+inputs:
+  path:
+    description: Path to cache (relative to workspace root)
+    required: false
+    default: .build
+  key-prefix:
+    description: Prefix for cache keys (must match the restore action)
+    required: false
+    default: swift-build
+  fix-docker-permissions:
+    description: Run chown on the build dir before saving (needed after Docker builds)
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Fix Docker build permissions
+      if: inputs.fix-docker-permissions == 'true'
+      shell: bash
+      run: |
+        if [ -d "${{ inputs.path }}" ]; then
+          sudo chown -R $(id -u):$(id -g) "${{ inputs.path }}"
+        fi
+
+    - name: Save Swift build cache
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
