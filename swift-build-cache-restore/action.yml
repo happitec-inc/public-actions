@@ -1,0 +1,33 @@
+name: Restore Swift Build Cache
+description: |
+  Restores a cached .build directory for Swift projects. Uses Package.swift
+  as the primary cache key with fallback to any prior build for the same
+  package manifest.
+
+inputs:
+  path:
+    description: Path to cache (relative to workspace root)
+    required: false
+    default: .build
+  key-prefix:
+    description: Prefix for cache keys (useful to separate Docker vs native builds)
+    required: false
+    default: swift-build
+
+outputs:
+  cache-hit:
+    description: Whether an exact cache match was found
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore Swift build cache
+      id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
+        restore-keys: |
+          ${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-
+          ${{ inputs.key-prefix }}-

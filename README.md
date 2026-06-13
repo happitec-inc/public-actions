@@ -4,6 +4,13 @@ Reusable GitHub Actions workflows for Swift projects and Homebrew taps.
 
 The workflows here are designed for public consumption: any external caller can `uses:` them without depending on internal infrastructure. Internal callers can layer their own conventions on top (runner selection, secret management) without forking.
 
+## Composite Actions
+
+| Action | Purpose |
+|---|---|
+| [`swift-build-cache-restore`](swift-build-cache-restore/action.yml) | Restore a cached `.build` directory for Swift projects. `uses: happitec-inc/public-actions/swift-build-cache-restore@main` |
+| [`swift-build-cache-save`](swift-build-cache-save/action.yml) | Save the `.build` directory after a Swift build, with Docker permission fix. `uses: happitec-inc/public-actions/swift-build-cache-save@main` |
+
 ## Workflows
 
 | Workflow | Purpose |
