@@ -27,8 +27,8 @@ run-name: "Sync OpenAPI spec → ${{ inputs.target-repo }}:${{ inputs.target-pat
 #         target-path: Sources/Generated/OpenAPI.yaml
 #         # target-base: main   # optional, defaults to main
 #
-# Required org-level secrets (already used by bump-tap-formula.yml /
-# switch-runners.yml — `secrets: inherit` forwards them):
+# Required org-level secrets (already used by bump-tap-formula.yml in this
+# repo — `secrets: inherit` forwards them):
 #   GH_COMPUTER_APP_ID       — happitec-computer App ID
 #   GH_COMPUTER_PRIVATE_KEY  — App private key (PEM)
 #
@@ -108,7 +108,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           # Token is owner-scoped (covers all repos the App is installed on).
           # Audit boundary is the App identity, not the per-token repo scope —
-          # consistent with bump-tap-formula.yml / switch-runners.yml.
+          # consistent with bump-tap-formula.yml.
 
       - name: Checkout target repo
         uses: actions/checkout@v6
@@ -122,8 +122,10 @@ jobs:
       - name: Resolve inputs
         id: vars
         env:
+          SOURCE_PATH: ${{ inputs.source-path }}
           TARGET_REPO: ${{ inputs.target-repo }}
           TARGET_PATH: ${{ inputs.target-path }}
+          TARGET_BASE: ${{ inputs.target-base }}
           SHA: ${{ github.sha }}
         run: |
           SHORT_SHA="${SHA:0:7}"
@@ -137,8 +139,8 @@ jobs:
           {
             echo "### OpenAPI spec sync"
             echo ""
-            echo "- Source: \`${GITHUB_REPOSITORY}:${{ inputs.source-path }}\` @ \`$SHORT_SHA\`"
-            echo "- Target: \`${TARGET_REPO}:${TARGET_PATH}\` (base \`${{ inputs.target-base }}\`)"
+            echo "- Source: \`${GITHUB_REPOSITORY}:${SOURCE_PATH}\` @ \`$SHORT_SHA\`"
+            echo "- Target: \`${TARGET_REPO}:${TARGET_PATH}\` (base \`${TARGET_BASE}\`)"
             echo "- Branch: \`$BRANCH\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
