@@ -1,0 +1,233 @@
+name: Sync OpenAPI Spec
+run-name: "Sync OpenAPI spec → ${{ inputs.target-repo }}:${{ inputs.target-path }}"
+
+# Reusable workflow for happitec-inc source repos to mirror an OpenAPI spec
+# into another repo by opening (or refreshing) a PR whenever the spec changes.
+# The target copy is made BYTE-IDENTICAL to the source — no transformation.
+#
+# Conceptually the OpenAPI analog of bump-tap-formula.yml: the source repo
+# calls this on push when its spec changes, and a PR is opened on the target.
+#
+# Caller usage (in the source repo that owns the spec):
+#
+#   # .github/workflows/sync-openapi.yml
+#   name: Sync OpenAPI Spec
+#   on:
+#     push:
+#       branches: [main]
+#       paths: ['openapi/OpenAPI.yaml']   # the spec's path in THIS repo
+#   permissions: {}
+#   jobs:
+#     sync:
+#       uses: happitec-inc/public-actions/.github/workflows/sync-openapi-spec.yml@main
+#       secrets: inherit
+#       with:
+#         source-path: openapi/OpenAPI.yaml
+#         target-repo: happitec-inc/some-client
+#         target-path: Sources/Generated/OpenAPI.yaml
+#         # target-base: main   # optional, defaults to main
+#
+# Required org-level secrets (already used by bump-tap-formula.yml /
+# switch-runners.yml — `secrets: inherit` forwards them):
+#   GH_COMPUTER_APP_ID       — happitec-computer App ID
+#   GH_COMPUTER_PRIVATE_KEY  — App private key (PEM)
+#
+# The happitec-computer App must be installed on BOTH:
+#   - the caller (source) repo — Contents: Read (to check the spec out), and
+#   - the target repo — Contents: Write + Pull requests: Write (to open the PR).
+# A brand-new target repo needs that one-time App install before the first sync.
+#
+# Runner: pinned to ubuntu-latest (GitHub-hosted) on purpose. This workflow
+# file lives in a PUBLIC repo, so it must never route a public/fork caller to
+# self-hosted Tart infrastructure. The job is a trivial file copy + PR, so a
+# hosted runner is the correct, cheapest, and safest choice — it does not take
+# a `runner` input.
+#
+# Behavior:
+#   - Idempotent: if the target already byte-matches the source, no PR is opened.
+#   - One PR per source commit: the branch is keyed on the target path + the
+#     source commit SHA, so each distinct spec change opens its own PR and
+#     re-runs of the same commit force-refresh that PR rather than duplicating.
+
+on:
+  workflow_call:
+    inputs:
+      source-path:
+        description: 'Path to the source OpenAPI spec within the CALLER repo checkout (e.g. openapi/OpenAPI.yaml).'
+        required: true
+        type: string
+      target-repo:
+        description: 'Target repo in owner/name form to receive the synced spec (e.g. happitec-inc/some-client).'
+        required: true
+        type: string
+      target-path:
+        description: 'Destination path for the spec within the target repo (e.g. Sources/Generated/OpenAPI.yaml).'
+        required: true
+        type: string
+      target-base:
+        description: 'Base branch on the target repo to open the PR against. Default: main.'
+        required: false
+        default: 'main'
+        type: string
+
+permissions: {}
+
+concurrency:
+  # One sync per (target-repo, target-path) at a time; serialize re-runs that
+  # touch the same destination, but allow independent targets to sync in parallel.
+  group: sync-openapi-${{ inputs.target-repo }}-${{ inputs.target-path }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout source (caller) repo
+        uses: actions/checkout@v6
+        with:
+          path: source
+
+      - name: Validate source spec exists
+        env:
+          SOURCE_PATH: ${{ inputs.source-path }}
+        run: |
+          SRC="source/${SOURCE_PATH}"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::source-path not found in caller checkout: ${SOURCE_PATH}"
+            exit 1
+          fi
+          echo "Source spec: $SRC ($(wc -c < "$SRC") bytes)"
+
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_COMPUTER_APP_ID }}
+          private-key: ${{ secrets.GH_COMPUTER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Token is owner-scoped (covers all repos the App is installed on).
+          # Audit boundary is the App identity, not the per-token repo scope —
+          # consistent with bump-tap-formula.yml / switch-runners.yml.
+
+      - name: Checkout target repo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.target-repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ inputs.target-base }}
+          path: target
+          fetch-depth: 0
+
+      - name: Resolve inputs
+        id: vars
+        env:
+          TARGET_REPO: ${{ inputs.target-repo }}
+          TARGET_PATH: ${{ inputs.target-path }}
+          SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${SHA:0:7}"
+          # Sanitize target-path into a branch-safe slug (each run of non-alnum → '-').
+          SLUG=$(printf '%s' "$TARGET_PATH" | tr -c 'A-Za-z0-9' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//')
+          BRANCH="sync-openapi/${SLUG}-${SHORT_SHA}"
+          {
+            echo "short_sha=$SHORT_SHA"
+            echo "branch=$BRANCH"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### OpenAPI spec sync"
+            echo ""
+            echo "- Source: \`${GITHUB_REPOSITORY}:${{ inputs.source-path }}\` @ \`$SHORT_SHA\`"
+            echo "- Target: \`${TARGET_REPO}:${TARGET_PATH}\` (base \`${{ inputs.target-base }}\`)"
+            echo "- Branch: \`$BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sync file + detect change
+        id: sync
+        env:
+          SOURCE_PATH: ${{ inputs.source-path }}
+          TARGET_PATH: ${{ inputs.target-path }}
+        run: |
+          SRC="source/${SOURCE_PATH}"
+          DEST="target/${TARGET_PATH}"
+          if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
+            echo "Target already byte-identical to source — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$(dirname "$DEST")"
+          cp "$SRC" "$DEST"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Diff to be PR'd:"
+          (cd target && git --no-pager diff -- "$TARGET_PATH" | head -200 || true)
+
+      - name: Create branch, commit, push, open PR
+        if: steps.sync.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target-repo }}
+          TARGET_PATH: ${{ inputs.target-path }}
+          TARGET_BASE: ${{ inputs.target-base }}
+          BRANCH: ${{ steps.vars.outputs.branch }}
+          SHORT_SHA: ${{ steps.vars.outputs.short_sha }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_PATH: ${{ inputs.source-path }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd target
+          git config user.name  "happitec-computer[bot]"
+          git config user.email "232697186+happitec-computer[bot]@users.noreply.github.com"
+
+          # Re-runs of the same source commit land on the same branch; force so the PR refreshes.
+          git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+          git add "$TARGET_PATH"
+          git commit -m "Sync OpenAPI spec → ${TARGET_PATH} (${SOURCE_REPO}@${SHORT_SHA})
+
+          Verbatim sync of ${SOURCE_PATH} from ${SOURCE_REPO} at ${SHA}.
+
+          Run: ${RUN_URL}
+          "
+          git push --force-with-lease origin "$BRANCH"
+
+          EXISTING=$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || true)
+          if [ -z "$EXISTING" ]; then
+            gh pr create \
+              --repo "$TARGET_REPO" \
+              --base "$TARGET_BASE" \
+              --head "$BRANCH" \
+              --title "Sync OpenAPI spec: ${TARGET_PATH} (${SOURCE_REPO}@${SHORT_SHA})" \
+              --body "$(cat <<EOF
+          ## Summary
+
+          Automated verbatim sync of the OpenAPI spec from \`${SOURCE_REPO}\` into \`${TARGET_PATH}\`. The file in this PR is **byte-identical** to the source.
+
+          - **Source**: \`${SOURCE_REPO}:${SOURCE_PATH}\` @ \`${SHA}\`
+          - **Target**: \`${TARGET_REPO}:${TARGET_PATH}\` (base \`${TARGET_BASE}\`)
+          - **Workflow run**: ${RUN_URL}
+
+          ## How this happened
+
+          The source repo's \`sync-openapi.yml\` workflow called \`happitec-inc/public-actions/.github/workflows/sync-openapi-spec.yml\` after the spec changed on a push.
+
+          ## Reviewer checklist
+
+          - [ ] The synced spec matches \`${SOURCE_REPO}\` at \`${SHA}\`
+          - [ ] No regenerated client / downstream code is needed in this PR (or it is tracked separately)
+          EOF
+          )"
+          else
+            echo "PR #$EXISTING already exists for $BRANCH; updated with the new commit."
+            gh pr comment "$EXISTING" --repo "$TARGET_REPO" --body "Refreshed by re-run: \`${SOURCE_REPO}@${SHORT_SHA}\`. Run: ${RUN_URL}"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          SKIP: ${{ steps.sync.outputs.skip }}
+          TARGET_REPO: ${{ inputs.target-repo }}
+          TARGET_PATH: ${{ inputs.target-path }}
+        run: |
+          if [ "$SKIP" = "true" ]; then
+            echo "Target \`${TARGET_REPO}:${TARGET_PATH}\` already up to date — no PR opened." >> "$GITHUB_STEP_SUMMARY"
+          fi
