@@ -83,9 +83,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_COMPUTER_APP_ID }}
+          private-key: ${{ secrets.GH_COMPUTER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Token is owner-scoped (covers all repos the App is installed on).
+          # Audit boundary is the App identity, not the per-token repo scope —
+          # consistent with bump-tap-formula.yml.
+
       - name: Checkout source (caller) repo
         uses: actions/checkout@v6
         with:
+          # Use the App token, not the default GITHUB_TOKEN. Callers wire this in
+          # with `permissions: {}` (the documented template), which leaves
+          # GITHUB_TOKEN with only metadata:read — enough to 404 the checkout of a
+          # PRIVATE caller repo ("Repository not found"). The owner-scoped App
+          # token reads the source the same way it writes the target; the App is
+          # installed on both. This is why the token step runs first.
+          token: ${{ steps.app-token.outputs.token }}
           path: source
 
       - name: Validate source spec exists
@@ -98,17 +116,6 @@ jobs:
             exit 1
           fi
           echo "Source spec: $SRC ($(wc -c < "$SRC") bytes)"
-
-      - name: Generate App token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.GH_COMPUTER_APP_ID }}
-          private-key: ${{ secrets.GH_COMPUTER_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          # Token is owner-scoped (covers all repos the App is installed on).
-          # Audit boundary is the App identity, not the per-token repo scope —
-          # consistent with bump-tap-formula.yml.
 
       - name: Checkout target repo
         uses: actions/checkout@v6
