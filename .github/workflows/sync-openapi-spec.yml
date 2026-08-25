@@ -45,9 +45,18 @@ run-name: "Sync OpenAPI spec → ${{ inputs.target-repo }}:${{ inputs.target-pat
 #
 # Behavior:
 #   - Idempotent: if the target already byte-matches the source, no PR is opened.
-#   - One PR per source commit: the branch is keyed on the target path + the
-#     source commit SHA, so each distinct spec change opens its own PR and
-#     re-runs of the same commit force-refresh that PR rather than duplicating.
+#   - ONE open PR per synced file: the branch is the FIXED
+#     sync-openapi/<target-path-slug>, with no commit suffix. It is rebuilt from
+#     the target's base HEAD and force-pushed on every sync, so a newer upstream
+#     commit UPDATES the existing PR (a PR tracks its head branch) instead of
+#     opening a sibling. "Which sync PR is current" is structurally unaskable.
+#
+#     This replaced a per-commit branch (`…-${SHORT_SHA}`), which opened a new
+#     PR per upstream commit. Concurrent open sync PRs for one file all look
+#     equally live, and merging the older silently adopts an older contract
+#     WITH GREEN CI — green-and-wrong, which is worse than red. Observed in
+#     practice: two sync PRs for one file open at once, carrying different
+#     contract versions, with nothing to mark either as superseded.
 
 on:
   workflow_call:
@@ -106,7 +115,8 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           path: source
 
-      - name: Validate source spec exists
+      - name: Validate source spec + read contract version
+        id: contract
         env:
           SOURCE_PATH: ${{ inputs.source-path }}
         run: |
@@ -117,6 +127,41 @@ jobs:
           fi
           echo "Source spec: $SRC ($(wc -c < "$SRC") bytes)"
 
+          # The contract version is what makes the single fixed-branch PR
+          # self-identifying: with one long-lived PR per file, the title is the
+          # only place a reader can see WHICH contract is currently proposed.
+          #
+          # yq ships preinstalled on the ubuntu-latest runner image.
+          VERSION=$(yq '.info.version' "$SRC" 2>/dev/null || true)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            # Fallback scoped twice over. First to the `info:` block: an
+            # unscoped grep would also match a `version:` under any other
+            # top-level key and report someone else's version as the contract.
+            # Then to EXACTLY two spaces of indent, so a nested key one level
+            # deeper — `info.license.version` is the realistic one — cannot be
+            # mistaken for `info.version` itself.
+            VERSION=$(awk '/^info:[[:space:]]*$/ {inside=1; next} inside && /^[^[:space:]#]/ {exit} inside' "$SRC" \
+              | grep -m1 -E '^  version:' \
+              | sed -E 's/^  version:[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//' || true)
+          fi
+          # Deliberately NON-fatal, and this is a considered deviation from the
+          # prior art for this fix, which exits 1 here. That version served a
+          # single caller; this workflow serves several. An unreadable version is a
+          # cosmetic loss (a title without a contract number) — failing the sync
+          # over it would turn a malformed `info:` block into a broken sync for
+          # every caller,
+          # trading the defect being fixed for a worse one.
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::warning::could not read info.version from ${SOURCE_PATH}; PR title will omit the contract version"
+            VERSION=""
+          else
+            echo "Contract version: $VERSION"
+          fi
+          # Single line only: a multi-line value would break the key=value
+          # format and corrupt every later write to this file.
+          VERSION=$(printf '%s' "$VERSION" | head -n1 | tr -d '\r')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Checkout target repo
         uses: actions/checkout@v6
         with:
@@ -124,6 +169,10 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           ref: ${{ inputs.target-base }}
           path: target
+          # fetch-depth 0 fetches +refs/heads/*:refs/remotes/origin/*, so the
+          # sync branch's remote-tracking ref exists whenever the branch exists
+          # remotely — that is what gives --force-with-lease below a real lease
+          # to check rather than a vacuous one.
           fetch-depth: 0
 
       - name: Resolve inputs
@@ -134,11 +183,15 @@ jobs:
           TARGET_PATH: ${{ inputs.target-path }}
           TARGET_BASE: ${{ inputs.target-base }}
           SHA: ${{ github.sha }}
+          VERSION: ${{ steps.contract.outputs.version }}
         run: |
           SHORT_SHA="${SHA:0:7}"
           # Sanitize target-path into a branch-safe slug (each run of non-alnum → '-').
           SLUG=$(printf '%s' "$TARGET_PATH" | tr -c 'A-Za-z0-9' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//')
-          BRANCH="sync-openapi/${SLUG}-${SHORT_SHA}"
+          # FIXED branch per synced file — deliberately NO commit suffix, so a
+          # newer source commit updates the one open PR instead of opening a
+          # sibling that competes with it.
+          BRANCH="sync-openapi/${SLUG}"
           {
             echo "short_sha=$SHORT_SHA"
             echo "branch=$BRANCH"
@@ -146,9 +199,13 @@ jobs:
           {
             echo "### OpenAPI spec sync"
             echo ""
-            echo "- Source: \`${GITHUB_REPOSITORY}:${SOURCE_PATH}\` @ \`$SHORT_SHA\`"
+            if [ -n "$VERSION" ]; then
+              echo "- Source: \`${GITHUB_REPOSITORY}:${SOURCE_PATH}\` @ \`$SHORT_SHA\` (contract \`$VERSION\`)"
+            else
+              echo "- Source: \`${GITHUB_REPOSITORY}:${SOURCE_PATH}\` @ \`$SHORT_SHA\`"
+            fi
             echo "- Target: \`${TARGET_REPO}:${TARGET_PATH}\` (base \`${TARGET_BASE}\`)"
-            echo "- Branch: \`$BRANCH\`"
+            echo "- Branch: \`$BRANCH\` (fixed; force-pushed)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Sync file + detect change
@@ -170,7 +227,7 @@ jobs:
           echo "Diff to be PR'd:"
           (cd target && git --no-pager diff -- "$TARGET_PATH" | head -200 || true)
 
-      - name: Create branch, commit, push, open PR
+      - name: Force-push fixed branch, open or update the single PR
         if: steps.sync.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -179,19 +236,33 @@ jobs:
           TARGET_BASE: ${{ inputs.target-base }}
           BRANCH: ${{ steps.vars.outputs.branch }}
           SHORT_SHA: ${{ steps.vars.outputs.short_sha }}
+          VERSION: ${{ steps.contract.outputs.version }}
           SOURCE_REPO: ${{ github.repository }}
           SOURCE_PATH: ${{ inputs.source-path }}
           SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          cd target
+          cd target || exit 1
           git config user.name  "happitec-computer[bot]"
           git config user.email "232697186+happitec-computer[bot]@users.noreply.github.com"
 
-          # Re-runs of the same source commit land on the same branch; force so the PR refreshes.
-          git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+          # Always rebuild the branch from the CURRENT base HEAD: -B resets an
+          # existing branch rather than failing, so the sync commit sits on
+          # today's base and never stacks on a stale prior sync. The remote
+          # branch is machine-owned; --force-with-lease guards the narrow race
+          # with a concurrent writer using the remote-tracking ref as its lease.
+          git checkout -B "$BRANCH"
           git add "$TARGET_PATH"
-          git commit -m "Sync OpenAPI spec → ${TARGET_PATH} (${SOURCE_REPO}@${SHORT_SHA})
+          if [ -n "$VERSION" ]; then
+            SUBJECT="Sync OpenAPI spec → ${TARGET_PATH} (${SOURCE_REPO}@${SHORT_SHA}, contract ${VERSION})"
+            TITLE="Sync OpenAPI spec: ${TARGET_PATH} (contract ${VERSION}, ${SOURCE_REPO}@${SHORT_SHA})"
+            VERSION_LINE="- **Contract version**: \`${VERSION}\`"
+          else
+            SUBJECT="Sync OpenAPI spec → ${TARGET_PATH} (${SOURCE_REPO}@${SHORT_SHA})"
+            TITLE="Sync OpenAPI spec: ${TARGET_PATH} (${SOURCE_REPO}@${SHORT_SHA})"
+            VERSION_LINE="- **Contract version**: unreadable from the source spec"
+          fi
+          git commit -m "$SUBJECT
 
           Verbatim sync of ${SOURCE_PATH} from ${SOURCE_REPO} at ${SHA}.
 
@@ -199,21 +270,24 @@ jobs:
           "
           git push --force-with-lease origin "$BRANCH"
 
-          EXISTING=$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || true)
-          if [ -z "$EXISTING" ]; then
-            gh pr create \
-              --repo "$TARGET_REPO" \
-              --base "$TARGET_BASE" \
-              --head "$BRANCH" \
-              --title "Sync OpenAPI spec: ${TARGET_PATH} (${SOURCE_REPO}@${SHORT_SHA})" \
-              --body "$(cat <<EOF
+          # Body written to a file rather than built with a heredoc inside a
+          # command substitution. That older shape is unparseable by bash 3.2
+          # (the default /bin/bash on macOS), so `bash -n` on this step could not
+          # tell a real syntax error from the shell's own limitation — a check
+          # that fails on known-good input measures nothing. --body-file parses
+          # everywhere, so this step is locally verifiable again.
+          BODY_FILE="${RUNNER_TEMP}/sync-openapi-pr-body.md"
+          cat > "$BODY_FILE" <<EOF
           ## Summary
 
           Automated verbatim sync of the OpenAPI spec from \`${SOURCE_REPO}\` into \`${TARGET_PATH}\`. The file in this PR is **byte-identical** to the source.
 
+          ${VERSION_LINE}
           - **Source**: \`${SOURCE_REPO}:${SOURCE_PATH}\` @ \`${SHA}\`
           - **Target**: \`${TARGET_REPO}:${TARGET_PATH}\` (base \`${TARGET_BASE}\`)
           - **Workflow run**: ${RUN_URL}
+
+          This PR rides the FIXED branch \`${BRANCH}\` and is force-push-updated on every upstream spec change, so it is the ONLY open sync PR for this file and always carries the NEWEST contract.
 
           ## How this happened
 
@@ -224,10 +298,24 @@ jobs:
           - [ ] The synced spec matches \`${SOURCE_REPO}\` at \`${SHA}\`
           - [ ] No regenerated client / downstream code is needed in this PR (or it is tracked separately)
           EOF
-          )"
+
+          # Upsert. gh pr create fails when an open PR already exists for the
+          # head branch, so check first. On the update path the force-push above
+          # has already refreshed the PR's diff; gh pr edit refreshes the title
+          # and body, which is what keeps the stated contract version from going
+          # stale on a long-lived PR.
+          EXISTING=$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' || true)
+          if [ -z "$EXISTING" ]; then
+            gh pr create \
+              --repo "$TARGET_REPO" \
+              --base "$TARGET_BASE" \
+              --head "$BRANCH" \
+              --title "$TITLE" \
+              --body-file "$BODY_FILE"
           else
-            echo "PR #$EXISTING already exists for $BRANCH; updated with the new commit."
-            gh pr comment "$EXISTING" --repo "$TARGET_REPO" --body "Refreshed by re-run: \`${SOURCE_REPO}@${SHORT_SHA}\`. Run: ${RUN_URL}"
+            gh pr edit "$EXISTING" --repo "$TARGET_REPO" --title "$TITLE" --body-file "$BODY_FILE"
+            gh pr comment "$EXISTING" --repo "$TARGET_REPO" --body "Force-push-refreshed to \`${SOURCE_REPO}@${SHORT_SHA}\`. Run: ${RUN_URL}"
+            echo "PR #$EXISTING updated in place (branch force-pushed, title/body refreshed)."
           fi
 
       - name: Summary
