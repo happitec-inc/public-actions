@@ -125,7 +125,21 @@ jobs:
             echo "::error::source-path not found in caller checkout: ${SOURCE_PATH}"
             exit 1
           fi
-          echo "Source spec: $SRC ($(wc -c < "$SRC") bytes)"
+          # Existence is not enough, and the byte count below was decoration
+          # until this check consumed it. A zero-byte source is never a valid
+          # OpenAPI document, and it fails in two directions that both look
+          # like success:
+          #   - against an empty target, `cmp -s` reports IDENTICAL, so the
+          #     job announces "already up to date" and opens nothing;
+          #   - against a good target, it syncs the emptiness — a PR titled
+          #     like any other sync whose content deletes the contract.
+          # Both are green-and-wrong. Refuse the input instead of comparing it.
+          BYTES=$(wc -c < "$SRC" | tr -d ' ')
+          if [ "$BYTES" -eq 0 ]; then
+            echo "::error::source spec is empty (0 bytes): ${SOURCE_PATH} — refusing to sync an empty contract"
+            exit 1
+          fi
+          echo "Source spec: $SRC ($BYTES bytes)"
 
           # The contract version is what makes the single fixed-branch PR
           # self-identifying: with one long-lived PR per file, the title is the
