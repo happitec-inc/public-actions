@@ -168,7 +168,7 @@ jobs:
     runs-on: ${{ fromJson(inputs.runner) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Select Xcode version
         if: inputs.xcode-version != ''
