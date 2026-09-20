@@ -1,0 +1,36 @@
+name: Test Bump Tap Formula
+# Decision logic and rewriter unit tests for bump-tap-formula.yml.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bump-tap-formula.yml'
+      - '.github/workflows/test-bump-tap-formula.yml'
+      - 'tests/bump-tap-downgrade-guard.sh'
+      - 'tests/bump-tap-url-style.sh'
+      - 'tests/bump-tap-name-resolution.sh'
+      - 'tests/bump-tap-revision-reset.sh'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  unit:
+    name: Unit — decision logic fixtures
+    runs-on: ${{ fromJson(vars.RUNNER_LINUX || '["ubuntu-latest"]') }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run downgrade-guard fixtures
+        run: bash tests/bump-tap-downgrade-guard.sh
+
+      - name: Run url-style fixtures
+        run: bash tests/bump-tap-url-style.sh
+
+      - name: Run name-resolution fixtures
+        run: bash tests/bump-tap-name-resolution.sh
+
+      - name: Run revision-reset fixtures
+        run: bash tests/bump-tap-revision-reset.sh

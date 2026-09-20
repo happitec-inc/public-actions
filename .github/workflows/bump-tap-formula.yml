@@ -2,10 +2,22 @@ name: Bump Tap Formula
 run-name: "Bump tap formula → ${{ inputs.formula || github.event.repository.name }} ${{ github.ref_name }}"
 
 # Reusable workflow for happitec-inc source repos to open a PR on
-# happitec-inc/homebrew-tap bumping the formula's `tag:` and `revision:`
-# pins to the just-pushed git tag.
+# happitec-inc/homebrew-tap bumping a formula to the just-pushed git tag on happitec-inc/homebrew-tap.
 #
-# Caller usage (in a source repo, e.g. happitec-inc/dash-issues):
+# Two formula styles are supported and auto-detected:
+#
+#   git-checkout — `url` pins `tag:` + `revision:` and Homebrew builds from
+#     source. Bumped by rewriting tag:, revision: (to the tag's commit SHA),
+#     and `version`.
+#
+#   asset-download — `url` points at a GitHub release asset
+#     (.../releases/download/<tag>/<file>) with a `sha256` of that asset, and
+#     Homebrew installs the prebuilt binary. Bumped by rewriting the tag
+#     segment of the url, `version`, and the `sha256` (recomputed from the new
+#     release's asset). Used when the binary must ship pre-signed — e.g.
+#     pre-signed artifacts whose code signature and permissions must survive the bump.
+#
+# Caller usage (in a source repo, e.g. happitec-inc/displayctrl):
 #
 #   # .github/workflows/bump-tap.yml
 #   name: Bump Homebrew Tap
@@ -15,32 +27,45 @@ run-name: "Bump tap formula → ${{ inputs.formula || github.event.repository.na
 #   permissions: {}
 #   jobs:
 #     bump:
-#       uses: happitec-inc/shared-actions/.github/workflows/bump-tap-formula.yml@main
+#       uses: happitec-inc/public-actions/.github/workflows/bump-tap-formula.yml@main
 #       secrets: inherit
 #       with:
 #         runner: ${{ vars.RUNNER_LINUX }}
 #         # Optional: override formula name if it differs from the repo name.
-#         # formula: dash-issues
+#         # formula: displayctrl
 #
 # Required org-level secrets (already used by switch-runners.yml):
 #   GH_COMPUTER_APP_ID       — happitec-computer App ID
 #   GH_COMPUTER_PRIVATE_KEY  — App private key (PEM)
 #
-# The App must be installed on both the caller repo (read) and on
+# The App must be installed on the caller repo (Contents: read — for
+# asset-download formulas, to read+download the release asset) and on
 # happitec-inc/homebrew-tap (Contents: Write, Pull requests: Write).
 #
 # Assumptions about the target formula:
-#   - Lives at Formula/<formula>.rb in happitec-inc/homebrew-tap.
+#   - Lives at Formula/<name>.rb (kind: formula) or Casks/<name>.rb
+#     (kind: cask) in happitec-inc/homebrew-tap.
 #   - Already exists. Initial registration is administrivia's job; this
 #     workflow only bumps existing pins.
-#   - Has a single `url ... tag: "v...", revision: "..."` block (the
-#     standard tap convention). Resources or multiple url blocks are
-#     not supported.
-#   - Has a top-level `version "..."` declaration. The workflow rewrites
-#     this in lockstep with `tag:` so that `brew info` and `Cellar/<name>/X.Y.Z`
-#     match the actual installed source. A formula without `version "..."`
-#     is allowed but the workflow logs a notice — Homebrew will infer
-#     version from the tag in that case.
+#   - git-checkout: a single `url ... tag: "v...", revision: "..."` block.
+#     Resources or multiple url blocks are not supported.
+#   - asset-download: a single `url ".../releases/download/<tag>/<file>"` whose
+#     asset filename is stable across releases, plus one `sha256` line.
+#     Two url styles are auto-detected:
+#       literal      - tag segment is a literal, e.g. /download/v0.1.11/.
+#                      Bumped by rewriting the tag segment, sha256, version.
+#       interpolated - tag segment is the version, e.g. /download/v#{version}/.
+#                      The url DERIVES from the version line, so ONLY sha256
+#                      and version are rewritten and the url is left alone.
+#                      Rewriting it would swap the interpolation for a
+#                      hardcoded tag and permanently desync url from version.
+#                      Casks using interpolated URLs derive their target from
+#                      version, so an interpolated url REQUIRES a version line (there is nothing to
+#                      interpolate otherwise), so the job fails loudly if it
+#                      is missing rather than emitting a broken url.
+#   - Has a top-level `version "..."` declaration, rewritten in lockstep. A
+#     formula without `version "..."` is allowed but the workflow logs a notice
+#     (Homebrew infers from the tag in the git-checkout case).
 
 on:
   workflow_call:
@@ -50,28 +75,41 @@ on:
         required: true
         type: string
       formula:
-        description: 'Formula name (filename without .rb). Defaults to the caller repo name.'
+        description: 'Artifact name (filename without .rb). Defaults to the caller repo name for kind: formula. REQUIRED for kind: cask — a cask is named for the application, not the repo, so the repo-name default risks targeting an unintended path.'
         required: false
         default: ''
+        type: string
+      kind:
+        description: 'Which tap directory to bump: formula (Formula/<name>.rb) or cask (Casks/<name>.rb). Default formula. Chosen explicitly rather than probing Formula/ and falling back to Casks/ - a fallback turns a typo in the name into a silent lookup in the other directory, and the resulting error names the wrong problem.'
+        required: false
+        default: 'formula'
         type: string
       tap-repo:
         description: 'Tap repo in owner/name form. Default: happitec-inc/homebrew-tap.'
         required: false
         default: 'happitec-inc/homebrew-tap'
         type: string
+      allow-downgrade:
+        description: 'Permit bumping the formula to a LOWER version than it currently pins. Default false — a downgrade normally means a mis-cut tag. Set true only for a deliberate rollback; the job then logs the downgrade loudly and proceeds.'
+        required: false
+        default: false
+        type: boolean
 
 permissions: {}
 
 concurrency:
   # One bump per (formula, tag) at a time; serialize re-runs of the same
   # tag push but allow independent formulas to bump in parallel.
-  group: bump-tap-formula-${{ inputs.formula || github.event.repository.name }}-${{ github.ref_name }}
+  group: bump-tap-formula-${{ inputs.kind }}-${{ inputs.formula || github.event.repository.name }}-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   bump:
     runs-on: ${{ fromJson(inputs.runner) }}
-    timeout-minutes: 5
+    # Generous: asset-download formulas poll for the release asset, which the
+    # release workflow publishes in parallel on the same tag push and can lag
+    # several minutes behind. git-checkout bumps still finish in seconds.
+    timeout-minutes: 20
     steps:
       - name: Validate trigger
         env:
@@ -91,15 +129,45 @@ jobs:
         id: vars
         env:
           INPUT_FORMULA: ${{ inputs.formula }}
+          KIND: ${{ inputs.kind }}
           REPO_NAME: ${{ github.event.repository.name }}
           TAG: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
           TAP_REPO: ${{ inputs.tap-repo }}
         run: |
+          # A cask is named for the application, not the repo. Defaulting to the
+          # repo name risks resolving an unintended path or colliding across
+          # Formula/ and Casks/ namespaces. Refuse when omitted for kind: cask.
+          if [ "$KIND" = "cask" ] && [ -z "$INPUT_FORMULA" ]; then
+            echo "::error::kind: cask requires an explicit formula: input. It was omitted, so the name would have defaulted to the repo name ('$REPO_NAME') and resolved Casks/${REPO_NAME}.rb. Pass formula: <cask-name>."
+            exit 1
+          fi
           FORMULA="${INPUT_FORMULA:-$REPO_NAME}"
-          BRANCH="bump/${FORMULA}-${TAG}"
+          # Recorded for the not-found error below, which otherwise cannot tell
+          # a wrong name from a name nobody supplied.
+          if [ -z "$INPUT_FORMULA" ]; then NAME_DEFAULTED=true; else NAME_DEFAULTED=false; fi
+
+          case "$KIND" in
+            formula) TAP_DIR=Formula ;;
+            cask)    TAP_DIR=Casks ;;
+            *) echo "::error::kind must be formula or cask (got '$KIND')."; exit 1 ;;
+          esac
+          REL_PATH="${TAP_DIR}/${FORMULA}.rb"
+
+          # Formula branches keep their historical name (bump/<formula>-<tag>).
+          # Casks use a bump/cask-<formula>-<tag> branch naming convention to
+          # partition cask bumps cleanly while remaining under the bump/ prefix.
+          if [ "$KIND" = "cask" ]; then
+            BRANCH="bump/cask-${FORMULA}-${TAG}"
+          else
+            BRANCH="bump/${FORMULA}-${TAG}"
+          fi
           {
             echo "formula=$FORMULA"
+            echo "kind=$KIND"
+            echo "name_defaulted=$NAME_DEFAULTED"
+            echo "tap_dir=$TAP_DIR"
+            echo "rel_path=$REL_PATH"
             echo "tag=$TAG"
             echo "sha=$SHA"
             echo "branch=$BRANCH"
@@ -137,53 +205,169 @@ jobs:
       - name: Verify formula exists and rewrite pins
         id: rewrite
         env:
+          # Needed by the asset-download path to read + download the release
+          # asset from the source repo.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           FORMULA: ${{ steps.vars.outputs.formula }}
+          KIND: ${{ steps.vars.outputs.kind }}
+          NAME_DEFAULTED: ${{ steps.vars.outputs.name_defaulted }}
+          REL_PATH: ${{ steps.vars.outputs.rel_path }}
           TAG: ${{ steps.vars.outputs.tag }}
           SHA: ${{ steps.vars.outputs.sha }}
+          ALLOW_DOWNGRADE: ${{ inputs.allow-downgrade }}
         run: |
-          FORMULA_PATH="tap/Formula/${FORMULA}.rb"
+          set -o pipefail
+          FORMULA_PATH="tap/${REL_PATH}"
           if [ ! -f "$FORMULA_PATH" ]; then
-            echo "::error::Formula not found at $FORMULA_PATH. Initial registration must happen before this workflow can bump."
+            # Name the LIKELIEST cause first. The old text led with "initial
+            # registration must happen", which is the rarest cause and sends the
+            # reader to the tap; a defaulted or mistyped name, and a wrong kind:,
+            # are both commoner and both live in the caller.
+            if [ "$NAME_DEFAULTED" = "true" ]; then
+              echo "::error::${KIND} not found at $FORMULA_PATH. The name was NOT passed by the caller, so it defaulted to the repo name. If the artifact is named something else, pass formula: <name>. Also check kind: -- if the file exists under the OTHER tap directory, kind: is wrong."
+            else
+              echo "::error::${KIND} not found at $FORMULA_PATH. Check the formula: input for a typo, and check kind: -- if the file exists under the OTHER tap directory, kind: is wrong. If the artifact genuinely has never been registered, that must happen before this workflow can bump it."
+            fi
             exit 1
           fi
 
-          # Capture the current tag/revision/version for the PR body and idempotency check.
           # NEW_VERSION is derived from TAG by stripping the leading 'v' (validated above).
           NEW_VERSION="${TAG#v}"
-          OLD_TAG=$(grep -E '^\s*tag:\s+"v' "$FORMULA_PATH" | head -1 | sed -E 's/.*tag:\s+"([^"]+)".*/\1/')
-          OLD_SHA=$(grep -E '^\s*revision:\s+"' "$FORMULA_PATH" | head -1 | sed -E 's/.*revision:\s+"([^"]+)".*/\1/')
-          OLD_VERSION=$(grep -E '^\s*version\s+"' "$FORMULA_PATH" | head -1 | sed -E 's/.*version\s+"([^"]+)".*/\1/')
-
-          if [ -z "$OLD_TAG" ] || [ -z "$OLD_SHA" ]; then
-            echo "::error::Could not parse existing tag: / revision: lines in $FORMULA_PATH."
-            echo "Found tag='$OLD_TAG' revision='$OLD_SHA'."
-            exit 1
-          fi
-          # OLD_VERSION absent is allowed (Homebrew can infer from tag), but warn.
+          OLD_VERSION=$(grep -E '^\s*version\s+"' "$FORMULA_PATH" | head -1 | sed -E 's/.*version\s+"([^"]+)".*/\1/' || true)
           if [ -z "$OLD_VERSION" ]; then
             echo "::notice::No \`version \"...\"\` line found in $FORMULA_PATH; Homebrew will infer from tag. Workflow will not write a version line where none exists."
           fi
 
-          if [ "$OLD_TAG" = "$TAG" ] && [ "$OLD_SHA" = "$SHA" ] && { [ -z "$OLD_VERSION" ] || [ "$OLD_VERSION" = "$NEW_VERSION" ]; }; then
-            echo "Formula already pinned to $TAG @ $SHA (version $NEW_VERSION) — nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          # ── Downgrade guard ──────────────────────────────────────────────────
+          # Refuse to bump a formula or cask BACKWARDS unless explicitly allowed.
+          #
+          # Why this exists: a mis-cut tag or stale local clone otherwise causes
+          # automated version regressions. Comparing version strings ensures that
+          # an older version tag cannot accidentally downgrade a published formula
+          # or cask in the tap.
+          #
+          # Compare with `sort -V` (version-aware), not lexicographic string compare.
+          # Lexicographic compare breaks on multi-digit components (e.g. "0.1.10" < "0.1.9"),
+          # which would falsely refuse legitimate bumps like 0.1.9 -> 0.1.10.
+          #
+          # Equal versions deliberately do NOT stop here. The per-mode skip logic
+          # below is sha-aware, allowing re-bumps if an asset was re-published.
+          #
+          # Note: if a formula or cask carries no explicit `version "..."` line,
+          # Homebrew infers it from the tag. Guarding only on the version line
+          # would leave those unguarded, so fall back to the pinned tag in `tag:`
+          # or the tag segment of the release-download url.
+          GUARD_OLD="$OLD_VERSION"
+          if [ -z "$GUARD_OLD" ]; then
+            # POSIX bracket classes (not \s) so this same expression can be
+              # verified locally on BSD sed as well as GNU sed on the runner.
+              GUARD_PIN=$(grep -E '^[[:space:]]*tag:[[:space:]]+"v' "$FORMULA_PATH" | head -1 | sed -E 's/.*tag:[[:space:]]+"([^"]+)".*/\1/' || true)
+            if [ -z "$GUARD_PIN" ]; then
+              GUARD_PIN=$(grep -oE '/releases/download/v[^/]+/' "$FORMULA_PATH" | head -1 | sed -E 's#/releases/download/(v[^/]+)/#\1#' || true)
+            fi
+            GUARD_OLD="${GUARD_PIN#v}"
+            [ -n "$GUARD_OLD" ] && echo "::notice::No version line in $FORMULA_PATH; downgrade guard comparing against the pinned tag ($GUARD_PIN)."
+          fi
+          if [ -z "$GUARD_OLD" ]; then
+            echo "::warning::Could not determine the formula's current version (no version line and no parseable pinned tag) — downgrade guard cannot run for $FORMULA."
           fi
 
-          # Surgical sed: only the first matching line in the file. Each
-          # formula in this tap has exactly one tag: / revision: pair (no
-          # resources, no multi-url blocks) and at most one `version "..."`
-          # line, enforced by the convention.
-          python3 - "$FORMULA_PATH" "$TAG" "$SHA" "$NEW_VERSION" <<'PY'
+          if [ -n "$GUARD_OLD" ] && [ "$GUARD_OLD" != "$NEW_VERSION" ]; then
+            LOWER=$(printf '%s\n%s\n' "$GUARD_OLD" "$NEW_VERSION" | sort -V | head -1)
+            if [ "$LOWER" = "$NEW_VERSION" ]; then
+              if [ "$ALLOW_DOWNGRADE" = "true" ]; then
+                echo "::warning::DOWNGRADE (deliberate): $FORMULA is pinned at $GUARD_OLD; tag $TAG requests $NEW_VERSION. Proceeding because allow-downgrade=true."
+                {
+                  echo "### :warning: Deliberate downgrade"
+                  echo ""
+                  echo "- Formula: \`$FORMULA\`"
+                  echo "- Currently pinned: \`$GUARD_OLD\`"
+                  echo "- Requested by tag \`$TAG\`: \`$NEW_VERSION\`"
+                  echo ""
+                  echo "\`allow-downgrade: true\` was set, so this bump proceeded."
+                } >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::error::Refusing to bump $FORMULA BACKWARDS: currently pinned $GUARD_OLD, but tag $TAG requests $NEW_VERSION."
+                {
+                  echo "### :no_entry: Bump refused — version would go backwards"
+                  echo ""
+                  echo "- Formula: \`$FORMULA\`"
+                  echo "- Currently pinned: \`$GUARD_OLD\`"
+                  echo "- Requested by tag \`$TAG\`: \`$NEW_VERSION\`"
+                  echo ""
+                  echo "This almost always means the tag was cut from a stale view of the"
+                  echo "tag list. Note that \`git fetch <url> <branch>\` does **not** fetch tags —"
+                  echo "check the remote (\`git ls-remote --tags\`) before tagging, delete the"
+                  echo "bad tag, and re-tag the same commit with the correct version."
+                  echo ""
+                  echo "If this downgrade is a deliberate rollback, re-run with"
+                  echo "\`allow-downgrade: true\`."
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+            fi
+          fi
+
+          # Classify the formula. A git-checkout formula pins tag:/revision:.
+          # An asset-download formula points url at a release asset and pins a
+          # sha256 of it. The two are bumped differently.
+          if grep -qE 'tag:\s+"v' "$FORMULA_PATH" && grep -qE '^\s*revision:\s+"' "$FORMULA_PATH"; then
+            MODE=git
+          elif grep -qE '/releases/download/v[^/]+/' "$FORMULA_PATH" && grep -qE '^\s*sha256\s+"' "$FORMULA_PATH"; then
+            MODE=asset
+          else
+            echo "::error::Could not classify $FORMULA_PATH as git-checkout (tag:/revision:) or asset-download (releases/download + sha256)."
+            exit 1
+          fi
+          if [ "$KIND" = "cask" ] && [ "$MODE" = "git" ]; then
+            echo "::error::$FORMULA_PATH parsed as a git-checkout artifact, but casks install prebuilt apps and have no tag:/revision: pins. Check the caller kind: input."
+            exit 1
+          fi
+          echo "::notice::Detected style: $MODE"
+
+          if [ "$MODE" = "git" ]; then
+            OLD_TAG=$(grep -E '^\s*tag:\s+"v' "$FORMULA_PATH" | head -1 | sed -E 's/.*tag:\s+"([^"]+)".*/\1/' || true)
+            OLD_REF=$(grep -E '^\s*revision:\s+"' "$FORMULA_PATH" | head -1 | sed -E 's/.*revision:\s+"([^"]+)".*/\1/' || true)
+            if [ -z "$OLD_TAG" ] || [ -z "$OLD_REF" ]; then
+              echo "::error::Could not parse existing tag: / revision: lines in $FORMULA_PATH."
+              echo "Found tag='$OLD_TAG' revision='$OLD_REF'."
+              exit 1
+            fi
+            NEW_REF="$SHA"
+
+            if [ "$OLD_TAG" = "$TAG" ] && [ "$OLD_REF" = "$NEW_REF" ] && { [ -z "$OLD_VERSION" ] || [ "$OLD_VERSION" = "$NEW_VERSION" ]; }; then
+              echo "Formula already pinned to $TAG @ $NEW_REF (version $NEW_VERSION) — nothing to do."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Surgical: only the first matching line. Each git-checkout formula in
+            # this tap has exactly one tag:/revision: pair and at most one version.
+            # Did the UPSTREAM version actually move? A bump can legitimately run
+            # with the version unchanged — an asset re-sign republishes the same
+            # tag with a different sha256, and the skip guards deliberately fall
+            # through so the new sha lands. On that path the packaging `revision`
+            # MUST be kept: dropping it takes pkg_version 1.29.0_2 -> 1.29.0,
+            # which is a DOWNGRADE, so `brew upgrade` no-ops and the corrected
+            # asset never reaches the machine — the exact failure `revision`
+            # exists to prevent. Reset it only when the version really moves.
+            # A formula with no `version "..."` derives its version from the tag,
+            # so there the tag moving IS the version moving.
+            if [ -n "$OLD_VERSION" ]; then
+              [ "$OLD_VERSION" != "$NEW_VERSION" ] && VERSION_MOVED=1 || VERSION_MOVED=0
+            else
+              [ "$OLD_TAG" != "$TAG" ] && VERSION_MOVED=1 || VERSION_MOVED=0
+            fi
+            echo "Version moved: $VERSION_MOVED (old='$OLD_VERSION' new='$NEW_VERSION')"
+
+            python3 - "$FORMULA_PATH" "$TAG" "$NEW_REF" "$NEW_VERSION" "$VERSION_MOVED" <<'PY'
           import re, sys
           path, new_tag, new_sha, new_version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          version_moved = sys.argv[5] == '1'
           with open(path, 'r', encoding='utf-8') as f:
               src = f.read()
-          # Replace only the first occurrence of each.
           new_src, n_tag = re.subn(r'(\btag:\s+")v[^"]+(")', rf'\g<1>{new_tag}\g<2>', src, count=1)
           new_src, n_sha = re.subn(r'(\brevision:\s+")[0-9a-f]{7,40}(")', rf'\g<1>{new_sha}\g<2>', new_src, count=1)
-          # Version line is optional — Homebrew infers from tag if absent.
-          # Match `version "0.1.2"` but NOT keyword forms (e.g. `tag: "..."`).
           new_src, n_ver = re.subn(
               r'(^\s*version\s+")[^"]+(")',
               rf'\g<1>{new_version}\g<2>',
@@ -191,8 +375,36 @@ jobs:
               count=1,
               flags=re.MULTILINE,
           )
+          # Drop a top-level `revision N`, which is Homebrew's PACKAGING revision
+          # and NOT the git `revision:` pin rewritten above — two different
+          # concepts that happen to share a word. It exists so a packaging-only
+          # change (a file added to an install allowlist, a patch) outranks the
+          # same upstream version, and Homebrew's DSL expects it to reset when
+          # the version moves. Nothing here removed it before, so it persisted:
+          # 0.3.1_1, 0.3.2_1, forever. See packaging revision reset on version bump.
+          #
+          # The `[ \t]+` after the bare word is what distinguishes the two: the
+          # git pin is `revision: "<sha>"`, where a colon follows immediately.
+          if version_moved:
+              new_src, n_rev = re.subn(
+                  r'^[ \t]*revision[ \t]+\d+[ \t]*\r?\n',
+                  '',
+                  new_src,
+                  flags=re.MULTILINE,
+              )
+          else:
+              # Version unchanged (e.g. an asset re-sign on the same tag). KEEP
+              # the packaging revision: dropping it here downgrades pkg_version
+              # and `brew upgrade` would no-op on the corrected artifact.
+              n_rev = 0
+              print("::notice::Version unchanged — keeping any packaging `revision` (dropping it here would downgrade pkg_version).")
+          if n_rev:
+              print(f"::notice::Dropped packaging `revision` ({n_rev} line) — the version bump resets it (packaging revision reset on version bump).")
           if n_tag != 1 or n_sha != 1:
               sys.stderr.write(f"Expected exactly 1 tag and 1 revision sub; got tag={n_tag} sha={n_sha}\n")
+              sys.exit(2)
+          if n_rev > 1:
+              sys.stderr.write(f"Expected 0 or 1 packaging-revision lines; got {n_rev}\n")
               sys.exit(2)
           if n_ver not in (0, 1):
               sys.stderr.write(f"Expected 0 or 1 version subs; got {n_ver}\n")
@@ -201,27 +413,226 @@ jobs:
               f.write(new_src)
           PY
 
+          else
+            # asset-download: parse the old tag, asset filename, and source repo
+            # straight from the release-download url.
+            # URL STYLE. An interpolated url writes the tag segment as the
+            # version, so the literal text between /download/ and the next / is
+            # not a tag at all. Parsing it as one yields a fake OLD_TAG, and
+            # rewriting it replaces the interpolation with a hardcoded tag --
+            # which silently breaks the artifact's single source of truth for
+            # its version. Detect the style FIRST and branch on it.
+            if grep -qF '/releases/download/v#{version}/' "$FORMULA_PATH"; then
+              URL_STYLE=interpolated
+            else
+              URL_STYLE=literal
+            fi
+            echo "::notice::Detected url style: $URL_STYLE"
+
+            if [ "$URL_STYLE" = "interpolated" ]; then
+              # The url follows the version line by construction, so the version
+              # line is load-bearing rather than cosmetic. Without it there is
+              # nothing to interpolate and the bump would emit a broken url.
+              if [ -z "$OLD_VERSION" ]; then
+                echo "::error::$FORMULA_PATH interpolates its url from the version, but has no version \"...\" line to rewrite."
+                exit 1
+              fi
+              OLD_TAG="v${OLD_VERSION}"
+            else
+              OLD_TAG=$(grep -oE '/releases/download/v[^/]+/' "$FORMULA_PATH" | head -1 | sed -E 's#/releases/download/(v[^/]+)/#\1#' || true)
+            fi
+            # KEEP THE LEADING v. It is not cosmetic: it is what stops this
+            # matching the GitHubPrivateRepositoryReleaseDownloadStrategy class
+            # that both casks embed, whose line reads
+            #   url_pattern = %r{https://github.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(\S+)}
+            # Without the v, [^/]+ matches '([^' there, that line wins head -1
+            # (it sits ~36 lines above the real url), and ASSET becomes '(\S+)}'.
+            # Non-empty, so the guard below passes, and the job then polls 15
+            # minutes for an asset by that name before blaming the release
+            # workflow for a parser bug. An interpolated url still matches this
+            # form, because v#{version} starts with v.
+            ASSET=$(grep -oE '/releases/download/v[^/]+/[^"]+' "$FORMULA_PATH" | head -1 | sed -E 's#.*/##' || true)
+            # Evaluate #{version} interpolation if present in the asset filename (e.g. displayctrl-v#{version}-macos.zip)
+            ASSET="${ASSET//\#\{version\}/$NEW_VERSION}"
+            SRC_REPO=$(grep -oE 'github\.com/[^/]+/[^/]+/releases/download/' "$FORMULA_PATH" | head -1 | sed -E 's#github\.com/([^/]+/[^/]+)/releases/download/#\1#' || true)
+            OLD_REF=$(grep -E '^\s*sha256\s+"' "$FORMULA_PATH" | head -1 | sed -E 's/.*sha256\s+"([^"]+)".*/\1/' || true)
+            if [ -z "$OLD_TAG" ] || [ -z "$ASSET" ] || [ -z "$SRC_REPO" ] || [ -z "$OLD_REF" ]; then
+              echo "::error::Could not parse asset-download url/sha256 in $FORMULA_PATH."
+              echo "Found old_tag='$OLD_TAG' asset='$ASSET' src_repo='$SRC_REPO' sha256='$OLD_REF'."
+              exit 1
+            fi
+            echo "Asset-download formula: src=$SRC_REPO asset=$ASSET old_tag=$OLD_TAG -> $TAG"
+
+            # Compute the published asset's current sha256 (NEW_REF) BEFORE
+            # deciding whether to skip. Asset signing is non-deterministic —
+            # re-publishing the SAME tag's asset (e.g. after a re-sign) yields a
+            # DIFFERENT sha256 (codesign --timestamp embeds an Apple secure
+            # timestamp; tar -czf embeds gzip mtime). A skip based on tag/version
+            # alone would leave the formula pinned to a stale, now-wrong sha256
+            # and break `brew install`. So we must know NEW_REF to detect drift.
+            #
+            # The release workflow publishes the asset in parallel on the same
+            # tag push, so it may not exist yet. Poll up to ~10 min (40 x 15s).
+            FOUND=
+            LAST_ERR=
+            for i in $(seq 1 40); do
+              ASSET_LIST=$(gh release view "$TAG" --repo "$SRC_REPO" --json assets -q '.assets[].name' 2>&1) && LAST_ERR= || LAST_ERR="$ASSET_LIST"
+              if [ -z "$LAST_ERR" ] && echo "$ASSET_LIST" | grep -qxF "$ASSET"; then
+                FOUND=1; break
+              fi
+              if [ "$i" -eq 1 ] && [ -n "$LAST_ERR" ]; then
+                echo "  notice: initial release check reported: $LAST_ERR"
+              fi
+              echo "  asset '$ASSET' not on $SRC_REPO release $TAG yet (attempt $i/40); sleeping 15s"
+              sleep 15
+            done
+            if [ -z "$FOUND" ]; then
+              if [ -n "$LAST_ERR" ]; then
+                echo "::error::Failed to query release $TAG on $SRC_REPO: $LAST_ERR"
+              else
+                echo "::error::Asset '$ASSET' did not appear on $SRC_REPO release $TAG within timeout. Did the release workflow publish it?"
+              fi
+              exit 1
+            fi
+
+            DL=$(mktemp -d)
+            gh release download "$TAG" --repo "$SRC_REPO" --pattern "$ASSET" --dir "$DL"
+            NEW_REF=$(sha256sum "$DL/$ASSET" | awk '{print $1}')
+            if [ -z "$NEW_REF" ]; then
+              echo "::error::Failed to compute sha256 of downloaded asset $DL/$ASSET."
+              exit 1
+            fi
+            echo "New asset sha256: $NEW_REF"
+
+            # Skip only when the tag, version, AND the pinned sha256 (OLD_REF)
+            # all match the freshly-published asset's sha256 (NEW_REF). Unlike a
+            # git-checkout revision (an immutable commit SHA), an asset's sha256
+            # can drift across re-publishes of the same tag, so the sha
+            # comparison is required for soundness. If it drifted, fall through
+            # and update the formula's sha256 (and url/version) below.
+            # For the interpolated style OLD_TAG was synthesised as v$OLD_VERSION,
+            # so this comparison reduces to a version check -- which is correct,
+            # because version is the only thing the url depends on.
+            if [ "$OLD_TAG" = "$TAG" ] && [ "$OLD_REF" = "$NEW_REF" ] && { [ -z "$OLD_VERSION" ] || [ "$OLD_VERSION" = "$NEW_VERSION" ]; }; then
+              echo "Already at $TAG @ sha256 $NEW_REF (version $NEW_VERSION) — nothing to do."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Rewrite the tag segment of the url, the sha256, and version.
+            # Did the UPSTREAM version actually move? A bump can legitimately run
+            # with the version unchanged — an asset re-sign republishes the same
+            # tag with a different sha256, and the skip guards deliberately fall
+            # through so the new sha lands. On that path the packaging `revision`
+            # MUST be kept: dropping it takes pkg_version 1.29.0_2 -> 1.29.0,
+            # which is a DOWNGRADE, so `brew upgrade` no-ops and the corrected
+            # asset never reaches the machine — the exact failure `revision`
+            # exists to prevent. Reset it only when the version really moves.
+            # A formula with no `version "..."` derives its version from the tag,
+            # so there the tag moving IS the version moving.
+            if [ -n "$OLD_VERSION" ]; then
+              [ "$OLD_VERSION" != "$NEW_VERSION" ] && VERSION_MOVED=1 || VERSION_MOVED=0
+            else
+              [ "$OLD_TAG" != "$TAG" ] && VERSION_MOVED=1 || VERSION_MOVED=0
+            fi
+            echo "Version moved: $VERSION_MOVED (old='$OLD_VERSION' new='$NEW_VERSION')"
+
+            python3 - "$FORMULA_PATH" "$OLD_TAG" "$TAG" "$NEW_REF" "$NEW_VERSION" "$URL_STYLE" "$VERSION_MOVED" <<'PY'
+          import re, sys
+          path, old_tag, new_tag, new_sha, new_version, url_style = sys.argv[1:7]
+          version_moved = sys.argv[7] == '1'
+          with open(path, 'r', encoding='utf-8') as f:
+              src = f.read()
+          if url_style == 'interpolated':
+              # Deliberately no url substitution: the url interpolates the
+              # version, so rewriting the version below moves the url with it.
+              new_src, n_url = src, 0
+          else:
+              new_src, n_url = re.subn(
+                  re.escape('/releases/download/' + old_tag + '/'),
+                  '/releases/download/' + new_tag + '/',
+                  src, count=1)
+          sha_candidates = len(re.findall(r'^\s*sha256\s+"[0-9a-f]{64}"', src, flags=re.MULTILINE))
+          if sha_candidates > 1:
+              sys.stderr.write(f"Multiple sha256 lines found ({sha_candidates}); multi-architecture artifacts require manual specification.\n")
+              sys.exit(2)
+          new_src, n_sha = re.subn(
+              r'(^\s*sha256\s+")[0-9a-f]{64}(")',
+              rf'\g<1>{new_sha}\g<2>', new_src, count=1, flags=re.MULTILINE)
+          new_src, n_ver = re.subn(
+              r'(^\s*version\s+")[^"]+(")',
+              rf'\g<1>{new_version}\g<2>', new_src, count=1, flags=re.MULTILINE)
+          # Drop a top-level `revision N` — Homebrew's PACKAGING revision, which
+          # must reset when the version moves. Asset-download formulas and casks
+          # have no git `revision:` pin, so there is nothing here to confuse it
+          # with, but the pattern is kept identical to the git-checkout path so
+          # the two cannot drift. See packaging revision reset on version bump.
+          if version_moved:
+              new_src, n_rev = re.subn(
+                  r'^[ \t]*revision[ \t]+\d+[ \t]*\r?\n',
+                  '',
+                  new_src,
+                  flags=re.MULTILINE,
+              )
+          else:
+              # Version unchanged (e.g. an asset re-sign on the same tag). KEEP
+              # the packaging revision: dropping it here downgrades pkg_version
+              # and `brew upgrade` would no-op on the corrected artifact.
+              n_rev = 0
+              print("::notice::Version unchanged — keeping any packaging `revision` (dropping it here would downgrade pkg_version).")
+          if n_rev:
+              print(f"::notice::Dropped packaging `revision` ({n_rev} line) — the version bump resets it (packaging revision reset on version bump).")
+          if (url_style != 'interpolated' and n_url != 1) or n_sha != 1:
+              sys.stderr.write(f"Expected exactly 1 url ({url_style}) and 1 sha256 sub; got url={n_url} sha256={n_sha}\n")
+              sys.exit(2)
+          if n_rev > 1:
+              sys.stderr.write(f"Expected 0 or 1 packaging-revision lines; got {n_rev}\n")
+              sys.exit(2)
+          if n_ver not in (0, 1):
+              sys.stderr.write(f"Expected 0 or 1 version subs; got {n_ver}\n")
+              sys.exit(2)
+          if url_style == 'interpolated' and n_ver != 1:
+              # Guarded upstream too, but assert here as well: writing the file
+              # with neither a url nor a version change would produce an empty
+              # diff and a bump PR claiming a change it did not make.
+              sys.stderr.write("Interpolated url requires exactly 1 version sub; got 0\n")
+              sys.exit(2)
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(new_src)
+          PY
+          fi
+
           {
+            echo "mode=$MODE"
             echo "old_tag=$OLD_TAG"
-            echo "old_sha=$OLD_SHA"
+            echo "old_ref=$OLD_REF"
+            echo "new_ref=$NEW_REF"
             echo "old_version=$OLD_VERSION"
             echo "new_version=$NEW_VERSION"
+            echo "url_style=${URL_STYLE:-n/a}"
             echo "skip=false"
           } >> "$GITHUB_OUTPUT"
 
           echo "Diff:"
-          (cd tap && git --no-pager diff "Formula/${FORMULA}.rb")
+          (cd tap && git --no-pager diff "$REL_PATH")
+          if (cd tap && git diff --quiet -- "$REL_PATH"); then
+            echo "::error::Rewrite produced no change to $REL_PATH. Refusing to open an empty bump PR."
+            exit 1
+          fi
 
       - name: Create branch, commit, push, open PR
         if: steps.rewrite.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           FORMULA: ${{ steps.vars.outputs.formula }}
+          KIND: ${{ steps.vars.outputs.kind }}
+          REL_PATH: ${{ steps.vars.outputs.rel_path }}
           TAG: ${{ steps.vars.outputs.tag }}
-          SHA: ${{ steps.vars.outputs.sha }}
+          MODE: ${{ steps.rewrite.outputs.mode }}
           BRANCH: ${{ steps.vars.outputs.branch }}
           OLD_TAG: ${{ steps.rewrite.outputs.old_tag }}
-          OLD_SHA: ${{ steps.rewrite.outputs.old_sha }}
+          OLD_REF: ${{ steps.rewrite.outputs.old_ref }}
+          NEW_REF: ${{ steps.rewrite.outputs.new_ref }}
           OLD_VERSION: ${{ steps.rewrite.outputs.old_version }}
           NEW_VERSION: ${{ steps.rewrite.outputs.new_version }}
           TAP_REPO: ${{ steps.vars.outputs.tap_repo }}
@@ -232,15 +643,19 @@ jobs:
           git config user.name  "happitec-computer[bot]"
           git config user.email "232697186+happitec-computer[bot]@users.noreply.github.com"
 
+          # For git-checkout the ref is a commit revision; for asset-download
+          # it is the asset's sha256. Label accordingly in the PR/commit body.
+          if [ "$MODE" = "asset" ]; then REF_LABEL="sha256"; else REF_LABEL="revision"; fi
+
           # Re-runs land on the same branch; force-push so the PR refreshes.
           git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
-          git add "Formula/${FORMULA}.rb"
+          git add "$REL_PATH"
           git commit -m "${FORMULA}: bump to ${TAG}
 
-          Triggered by tag push on ${SOURCE_REPO}.
+          Triggered by tag push on ${SOURCE_REPO} (${MODE} ${KIND}).
 
-          Old: ${OLD_TAG} @ ${OLD_SHA} (version ${OLD_VERSION:-<none>})
-          New: ${TAG} @ ${SHA} (version ${NEW_VERSION})
+          Old: ${OLD_TAG} @ ${REF_LABEL} ${OLD_REF} (version ${OLD_VERSION:-<none>})
+          New: ${TAG} @ ${REF_LABEL} ${NEW_REF} (version ${NEW_VERSION})
 
           Run: ${RUN_URL}
           "
@@ -257,28 +672,28 @@ jobs:
               --body "$(cat <<EOF
           ## Summary
 
-          Automated bump of \`Formula/${FORMULA}.rb\` from \`${OLD_TAG}\` to \`${TAG}\`.
+          Automated bump of \`${REL_PATH}\` (${MODE} ${KIND}) from \`${OLD_TAG}\` to \`${TAG}\`.
 
-          - **Old**: \`${OLD_TAG}\` @ \`${OLD_SHA}\` (version \`${OLD_VERSION:-<none>}\`)
-          - **New**: \`${TAG}\` @ \`${SHA}\` (version \`${NEW_VERSION}\`)
+          - **Old**: \`${OLD_TAG}\` @ ${REF_LABEL} \`${OLD_REF}\` (version \`${OLD_VERSION:-<none>}\`)
+          - **New**: \`${TAG}\` @ ${REF_LABEL} \`${NEW_REF}\` (version \`${NEW_VERSION}\`)
           - **Source**: ${SOURCE_REPO}
           - **Trigger**: tag push on \`${TAG}\`
           - **Workflow run**: ${RUN_URL}
 
           ## How this happened
 
-          The source repo's \`bump-tap.yml\` workflow called \`happitec-inc/shared-actions/.github/workflows/bump-tap-formula.yml\` after a tag matching \`v*\` was pushed.
+          The source repo's \`bump-tap.yml\` workflow called \`happitec-inc/public-actions/.github/workflows/bump-tap-formula.yml\` after a tag matching \`v*\` was pushed.
 
           ## Reviewer checklist
 
           - [ ] \`${TAG}\` is a real tag in the source repo
-          - [ ] \`${SHA}\` is the commit the tag points at
+          - [ ] For asset-download: the \`sha256\` matches the published release asset
           - [ ] No formula structure changes are needed for this version (e.g. new dependency, changed install steps)
           EOF
           )"
           else
             echo "PR #$EXISTING already exists for $BRANCH; updated with new commits."
-            gh pr comment "$EXISTING" --repo "$TAP_REPO" --body "Refreshed by re-run: \`${TAG}\` @ \`${SHA}\`. Run: ${RUN_URL}"
+            gh pr comment "$EXISTING" --repo "$TAP_REPO" --body "Refreshed by re-run: \`${TAG}\` @ ${REF_LABEL} \`${NEW_REF}\`. Run: ${RUN_URL}"
           fi
 
       - name: Summary
@@ -286,8 +701,28 @@ jobs:
         env:
           SKIP: ${{ steps.rewrite.outputs.skip }}
           FORMULA: ${{ steps.vars.outputs.formula }}
+          KIND: ${{ steps.vars.outputs.kind }}
           TAG: ${{ steps.vars.outputs.tag }}
         run: |
           if [ "$SKIP" = "true" ]; then
-            echo "Formula \`${FORMULA}\` already at \`${TAG}\` — no PR opened." >> "$GITHUB_STEP_SUMMARY"
+            # ::notice:: as well as the step summary. A skip exits 0 with the PR
+            # step gated off, so the job goes GREEN having opened no PR. The
+            # ordinary way to reach that is a hand-bump race: someone bumps the
+            # tap by hand, the tag push fires this, it finds nothing to do. The
+            # observer sees green + no PR, concludes the automation never ran,
+            # and goes looking in the release workflow -- with nothing red
+            # anywhere to correct them. The step summary already said so, but
+            # not where anyone looks first. An annotation shows on the run.
+            # Deliberately does NOT name what was compared. There are two skip
+            # paths and they compare different things: the asset-download path
+            # compares a sha256, the git-checkout path compares a revision (a
+            # commit SHA, not a checksum). MODE is not an output of the rewrite
+            # step, so this step cannot tell them apart -- and a signal that
+            # names the wrong mechanism is the exact defect this PR exists to
+            # remove. Naming neither costs the reader nothing.
+            # Causes are listed without ranking: a hand-bump before the tag
+            # push, a plain re-run, and a re-pushed tag all land here, and
+            # nothing measures which is commonest.
+            echo "::notice::No PR opened: ${KIND} ${FORMULA} is already at ${TAG}, so there was nothing to bump. This is a successful no-op, not a failed bump -- it happens when the tap was already bumped by hand, when a run is repeated, or when a tag is re-pushed."
+            echo "\`${KIND}\` \`${FORMULA}\` already at \`${TAG}\` — nothing to bump, no PR opened (successful no-op)." >> "$GITHUB_STEP_SUMMARY"
           fi
