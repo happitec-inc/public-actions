@@ -8,6 +8,7 @@ The workflows here are designed for public consumption: any external caller can 
 
 | Action | Purpose |
 |---|---|
+| [`bump-policy`](bump-policy/action.yml) | Content-validating gate for Homebrew tap bump PRs: check the diff really is a bump, and verify the new pin against the source repo. `uses: happitec-inc/public-actions/bump-policy@main` |
 | [`swift-build-cache-restore`](swift-build-cache-restore/action.yml) | Restore a cached `.build` directory for Swift projects. `uses: happitec-inc/public-actions/swift-build-cache-restore@main` |
 | [`swift-build-cache-save`](swift-build-cache-save/action.yml) | Save the `.build` directory after a Swift build, with Docker permission fix. `uses: happitec-inc/public-actions/swift-build-cache-save@main` |
 
@@ -19,6 +20,62 @@ The workflows here are designed for public consumption: any external caller can 
 | [`.github/workflows/deploy-docc.yml`](.github/workflows/deploy-docc.yml) | Build Swift DocC documentation and publish to GitHub Pages. |
 
 Each workflow's own header comment carries detailed input/secret reference and example callers — start there.
+
+## `bump-policy`: three verdicts, and one thing you must not do
+
+A tap's auto-merge gate usually keys on branch prefix plus PR author. Identity is
+not evidence: that proves a machine opened the PR, not that the diff is a bump.
+`bump-policy` reads the diff instead, and verifies the new pin against the source
+repo — the tag must resolve to the pinned revision, or the release asset must
+hash to the pinned `sha256`.
+
+It emits **three** verdicts, and the distinction is what makes the check safe to
+mark required:
+
+| Verdict | Exit | Behaviour |
+|---|---|---|
+| `pass` | 0 | Pure bump, payload verified. Posts an approving review when `review-token` is supplied. |
+| `abstain` | 0 | **Silent.** Not a pure bump — new formula or cask, new tap, download-strategy change, extra content riding along. No approval, so the missing review still blocks the merge. |
+| `fail` | 2 | Bump-shaped and the payload assertion is false. Hard block. |
+
+`abstain` is why the check can be required without walling off new content. A
+two-verdict version of this gate would make a new-formula PR fail a *required*
+check and become unmergeable — exactly the class of change that is supposed to
+get eyes on it.
+
+> [!WARNING]
+> **Do not put an `if:` on the calling job.** A job skipped by a job-level `if:`
+> reports its check to branch protection as *satisfied*. Once this check is also
+> an approval source, every skip path becomes an approval path. Keep the trigger
+> unfiltered and let the driver abstain; abstaining is already green.
+
+The approving review is gated on an affirmative `approve: true` in the driver's
+result JSON — never on a green exit, because a green exit covers `abstain` too.
+Omit `review-token` entirely and the action is a pure check: it still classifies
+and still fails on a false payload, it just never approves anything.
+
+Example caller:
+
+```yaml
+on:
+  pull_request:        # no branch or author filter — see the warning above
+
+jobs:
+  bump-policy:
+    runs-on: ${{ fromJson(vars.RUNNER_LINUX || '["ubuntu-latest"]') }}
+    permissions:
+      contents: read         # actions/checkout of the tap
+      pull-requests: read    # read the allow-downgrade label
+    steps:
+      - uses: happitec-inc/public-actions/bump-policy@main
+        with:
+          # Must read the SOURCE repos, not just the tap — the default
+          # GITHUB_TOKEN cannot. Use an App installation token.
+          token: ${{ steps.app-token.outputs.token }}
+          # OPTIONAL. A *different* App from the one that opens bump PRs:
+          # GitHub refuses to let a PR's own author approve it.
+          review-token: ${{ steps.reviewer-token.outputs.token }}
+```
 
 ## Runner selection: the `vars.RUNNER_*` pattern
 
