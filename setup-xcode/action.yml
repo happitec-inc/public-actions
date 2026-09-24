@@ -6,17 +6,23 @@ description: |
   Usage:
     - uses: happitec-inc/public-actions/setup-xcode@main
       with:
-        xcode-version: '26'  # optional, defaults to '26'
+        xcode-version: '27'  # optional; omit to keep the runner's selected Xcode
 
-  The action scans /Applications for a matching Xcode_<version>*.app, falls
+  With no xcode-version, the Xcode the runner image already has selected is
+  kept, so the image is the one place the toolchain is chosen. With a version,
+  the action scans /Applications for a matching Xcode_<version>*.app, falls
   back to the default Xcode.app if no versioned copy is present, and verifies
   the selection by printing xcodebuild, Swift, and SDK versions.
 
 inputs:
   xcode-version:
-    description: 'Xcode major version to select (e.g. "26"). Matches Xcode_<version>*.app via glob.'
+    description: >
+      Xcode major version to select (e.g. "27"), matched against
+      /Applications/Xcode_<version>*.app. Leave empty (the default) to keep the
+      Xcode the runner image already has selected, so callers don't carry a
+      second copy of the toolchain pin that goes stale when the image moves.
     required: false
-    default: '26'
+    default: ''
 
 runs:
   using: 'composite'
@@ -26,8 +32,18 @@ runs:
       run: |
         VERSION="${{ inputs.xcode-version }}"
 
-        # Find the matching Xcode installation
-        XCODE_APP=$(ls -d /Applications/Xcode_${VERSION}*.app 2>/dev/null | sort -V | tail -1)
+        # No version requested: keep the runner image's own selection. A default
+        # of "26" here broke macOS jobs when the self-hosted runner image moved to
+        # Xcode 27 (only Xcode_27.app installed, no Xcode.app) on 2026-09-24.
+        if [ -z "$VERSION" ]; then
+          echo "No xcode-version requested; keeping the runner's selected Xcode: $(xcode-select -p)"
+          exit 0
+        fi
+
+        # Find the matching Xcode installation. `|| true`: with no match, `ls`
+        # fails, and under this step's `-o pipefail` the assignment would abort
+        # the script before the fallback and the error message below could run.
+        XCODE_APP=$(ls -d /Applications/Xcode_${VERSION}*.app 2>/dev/null | sort -V | tail -1 || true)
 
         if [ -z "$XCODE_APP" ]; then
           # Fall back to default Xcode.app if no versioned app found
