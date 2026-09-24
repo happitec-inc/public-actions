@@ -14,9 +14,9 @@ on:
         default: '["macos-26"]'
         type: string
       xcode-version:
-        description: 'Xcode major version'
+        description: "Xcode major version. Empty (default) keeps the runner image's selected Xcode."
         required: false
-        default: '26'
+        default: ''
         type: string
 
 jobs:
