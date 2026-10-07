@@ -81,7 +81,7 @@ on:
         default: 'main'
         type: string
       runner:
-        description: 'Runner label as a JSON string. Default: ["ubuntu-latest"] (GitHub-hosted), for public callers. A private caller must pass vars.RUNNER_LINUX (shared-standards B6).'
+        description: 'Runner label as a JSON string. Default: ["ubuntu-latest"] (GitHub-hosted), for public callers. A private caller must pass the expression vars.RUNNER_LINUX, not the literal string (shared-standards B6; see the header for the exact line).'
         required: false
         default: '["ubuntu-latest"]'
         type: string
@@ -152,8 +152,15 @@ jobs:
           # self-identifying: with one long-lived PR per file, the title is the
           # only place a reader can see WHICH contract is currently proposed.
           #
-          # yq ships preinstalled on the ubuntu-latest runner image.
+          # Three readers, tried in order:
+          #   - yq: preinstalled on the hosted ubuntu-latest image (the default
+          #     runner). It reads YAML and JSON. Not on the Tart RUNNER_LINUX image.
+          #   - jq: on both images. It reads a JSON spec and fails (empty) on YAML.
+          #   - awk: last resort, YAML only.
           VERSION=$(yq '.info.version' "$SRC" 2>/dev/null || true)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            VERSION=$(jq -r '.info.version // empty' "$SRC" 2>/dev/null || true)
+          fi
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
             # Fallback scoped twice over. First to the `info:` block: an
             # unscoped grep would also match a `version:` under any other
