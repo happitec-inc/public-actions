@@ -22,6 +22,7 @@ run-name: "Sync OpenAPI spec → ${{ inputs.target-repo }}:${{ inputs.target-pat
 #       uses: happitec-inc/public-actions/.github/workflows/sync-openapi-spec.yml@main
 #       secrets: inherit
 #       with:
+#         runner: ${{ vars.RUNNER_LINUX }}   # required in a PRIVATE caller (B6)
 #         source-path: openapi/OpenAPI.yaml
 #         target-repo: happitec-inc/some-client
 #         target-path: Sources/Generated/OpenAPI.yaml
@@ -37,11 +38,12 @@ run-name: "Sync OpenAPI spec → ${{ inputs.target-repo }}:${{ inputs.target-pat
 #   - the target repo — Contents: Write + Pull requests: Write (to open the PR).
 # A brand-new target repo needs that one-time App install before the first sync.
 #
-# Runner: pinned to ubuntu-latest (GitHub-hosted) on purpose. This workflow
-# file lives in a PUBLIC repo, so it must never route a public/fork caller to
-# self-hosted Tart infrastructure. The job is a trivial file copy + PR, so a
-# hosted runner is the correct, cheapest, and safest choice — it does not take
-# a `runner` input.
+# Runner: the `runner` input, a JSON string, defaults to '["ubuntu-latest"]'
+# (GitHub-hosted). This workflow file lives in a PUBLIC repo, so the default
+# must never send a public or fork caller to self-hosted Tart infrastructure.
+# A PRIVATE caller must pass `runner: ${{ vars.RUNNER_LINUX }}`, per
+# shared-standards B6 (a hosted runner is for public repos only; Erin's call,
+# 2026-09-25) and policy form 4. A public caller can omit it.
 #
 # Behavior:
 #   - Idempotent: if the target already byte-matches the source, no PR is opened.
@@ -78,6 +80,11 @@ on:
         required: false
         default: 'main'
         type: string
+      runner:
+        description: 'Runner label as a JSON string. Default: ["ubuntu-latest"] (GitHub-hosted), for public callers. A private caller must pass vars.RUNNER_LINUX (shared-standards B6).'
+        required: false
+        default: '["ubuntu-latest"]'
+        type: string
 
 permissions: {}
 
@@ -89,7 +96,7 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJson(inputs.runner) }}
     timeout-minutes: 5
     steps:
       - name: Generate App token
