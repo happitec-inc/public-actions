@@ -4,6 +4,11 @@ description: |
   as the primary cache key with fallback to any prior build for the same
   package manifest.
 
+  The cache lives in the org's S3 cache bucket (via runs-on/cache), not in
+  GitHub's cache. The calling job must grant `permissions: id-token: write`
+  and must not run this action for fork pull requests, which get no OIDC
+  token. Every key is prefixed with the calling repository's name.
+
 inputs:
   path:
     description: Path to cache (relative to workspace root)
@@ -22,12 +27,42 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Require an OIDC token and the cache role variable
+      id: oidc
+      shell: bash
+      env:
+        CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}
+      run: |
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error title=No OIDC token::This action stores the build cache in the org's S3 cache bucket and needs a GitHub OIDC token. The calling job must grant 'permissions: id-token: write'. Pull requests from forks never receive an OIDC token, so the calling workflow must skip the cache steps for fork pull requests (for example: if: github.event.pull_request.head.repo.fork != true). There is no fallback to GitHub's cache."
+          exit 1
+        fi
+        if [ -z "$CACHE_ROLE_ARN" ]; then
+          echo "::error title=CI_CACHE_ROLE_ARN not set::The Actions variable CI_CACHE_ROLE_ARN (the cache role to assume) is not visible to this repository. Set it as an organization variable shared with this repository."
+          exit 1
+        fi
+
+    - name: Assume the cache role
+      id: aws
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: ${{ vars.CI_CACHE_ROLE_ARN }}
+        aws-region: us-east-1
+        output-credentials: true
+        output-env-credentials: false
+
     - name: Restore Swift build cache
       id: restore
-      uses: actions/cache/restore@v5
+      uses: runs-on/cache/restore@88d90644011a3a9957fd141a106f5a94f9794203 # v5.0.7
+      env:
+        RUNS_ON_S3_BUCKET_CACHE: happitec-ci-cache
+        AWS_REGION: us-east-1
+        AWS_ACCESS_KEY_ID: ${{ steps.aws.outputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ steps.aws.outputs.aws-secret-access-key }}
+        AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
       with:
         path: ${{ inputs.path }}
-        key: ${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
+        key: ${{ github.repository }}/${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
         restore-keys: |
-          ${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-
-          ${{ inputs.key-prefix }}-
+          ${{ github.repository }}/${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-
+          ${{ github.repository }}/${{ inputs.key-prefix }}-
