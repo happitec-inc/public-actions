@@ -6,9 +6,10 @@ description: |
 
   The cache lives in the org's S3 cache bucket (via runs-on/cache), not in
   GitHub's cache. The calling job must grant `permissions: id-token: write`,
-  set `env: CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}` (composite
-  actions cannot read `vars` themselves), and must not run this action for fork pull requests, which get no OIDC
-  token. Every key is prefixed with the calling repository's name.
+  set the CI_CACHE_ROLE_ARN environment variable from the org Actions
+  variable of the same name (composite actions cannot read the vars
+  context), and must not run this action for fork pull requests, which get
+  no OIDC token. Every key is prefixed with the calling repository's name.
 
 inputs:
   path:
@@ -39,7 +40,7 @@ runs:
           exit 1
         fi
         if [ -z "$CACHE_ROLE_ARN" ]; then
-          echo "::error title=CI_CACHE_ROLE_ARN empty::The environment variable CI_CACHE_ROLE_ARN (the cache role to assume) is empty. Set it on the calling job or workflow: env: CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}, with CI_CACHE_ROLE_ARN defined as an organization Actions variable visible to this repository."
+          echo "::error title=CI_CACHE_ROLE_ARN empty::The environment variable CI_CACHE_ROLE_ARN (the cache role to assume) is empty. Set it on the calling job or workflow from the org Actions variable of the same name, which must be defined and visible to this repository."
           exit 1
         fi
 
