@@ -5,8 +5,9 @@ description: |
   package manifest.
 
   The cache lives in the org's S3 cache bucket (via runs-on/cache), not in
-  GitHub's cache. The calling job must grant `permissions: id-token: write`
-  and must not run this action for fork pull requests, which get no OIDC
+  GitHub's cache. The calling job must grant `permissions: id-token: write`,
+  set `env: CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}` (composite
+  actions cannot read `vars` themselves), and must not run this action for fork pull requests, which get no OIDC
   token. Every key is prefixed with the calling repository's name.
 
 inputs:
@@ -31,14 +32,14 @@ runs:
       id: oidc
       shell: bash
       env:
-        CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}
+        CACHE_ROLE_ARN: ${{ env.CI_CACHE_ROLE_ARN }}
       run: |
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
           echo "::error title=No OIDC token::This action stores the build cache in the org's S3 cache bucket and needs a GitHub OIDC token. The calling job must grant 'permissions: id-token: write'. Pull requests from forks never receive an OIDC token, so the calling workflow must skip the cache steps for fork pull requests (for example: if: github.event.pull_request.head.repo.fork != true). There is no fallback to GitHub's cache."
           exit 1
         fi
         if [ -z "$CACHE_ROLE_ARN" ]; then
-          echo "::error title=CI_CACHE_ROLE_ARN not set::The Actions variable CI_CACHE_ROLE_ARN (the cache role to assume) is not visible to this repository. Set it as an organization variable shared with this repository."
+          echo "::error title=CI_CACHE_ROLE_ARN empty::The environment variable CI_CACHE_ROLE_ARN (the cache role to assume) is empty. Set it on the calling job or workflow: env: CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}, with CI_CACHE_ROLE_ARN defined as an organization Actions variable visible to this repository."
           exit 1
         fi
 
@@ -46,7 +47,7 @@ runs:
       id: aws
       uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
       with:
-        role-to-assume: ${{ vars.CI_CACHE_ROLE_ARN }}
+        role-to-assume: ${{ env.CI_CACHE_ROLE_ARN }}
         aws-region: us-east-1
         output-credentials: true
         output-env-credentials: false

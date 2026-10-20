@@ -4,7 +4,8 @@ name: Test Swift Build Cache
 # then checks the saved content came back. A second job runs the restore
 # action without id-token: write and expects the clear OIDC error.
 #
-# Needs the org Actions variable CI_CACHE_ROLE_ARN to be visible to this repo.
+# Needs the org Actions variable CI_CACHE_ROLE_ARN to be visible to this repo;
+# the jobs hand it to the actions as an environment variable.
 # Pull requests from forks get no OIDC token, so the jobs are skipped for them.
 
 on:
@@ -30,6 +31,7 @@ jobs:
       contents: read
       id-token: write
     env:
+      CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}
       # Unique per run so the first restore is always a miss.
       KEY_PREFIX: cachetest-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -86,6 +88,8 @@ jobs:
     runs-on: ${{ fromJson(vars.RUNNER_LINUX || '["ubuntu-latest"]') }}
     permissions:
       contents: read
+    env:
+      CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -102,3 +106,27 @@ jobs:
           if [ "${{ steps.restore.outcome }}" != "failure" ]; then
             echo "::error::restore without id-token: write should fail, got '${{ steps.restore.outcome }}'"; exit 1
           fi
+
+  # The no-oidc job above only proves the restore step failed. This job reads
+  # that job's log and checks it failed with the OIDC message, not for some
+  # other reason (a failure to load the action would also look green).
+  no-oidc-reason:
+    name: Failure was the OIDC error
+    needs: no-oidc
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJson(vars.RUNNER_LINUX || '["ubuntu-latest"]') }}
+    permissions:
+      actions: read
+    steps:
+      - name: Check the log of the no-oidc job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jobs=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100")
+          id=$(echo "$jobs" | jq -r '.jobs[] | select(.name == "Clear error without id-token") | .id')
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" > nooidc.log
+          grep -q "needs a GitHub OIDC token" nooidc.log || { echo "::error::no-oidc job did not fail with the OIDC message"; exit 1; }
+          echo "no-oidc job failed with the expected OIDC message"
