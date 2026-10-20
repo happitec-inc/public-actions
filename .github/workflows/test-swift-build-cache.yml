@@ -1,0 +1,132 @@
+name: Test Swift Build Cache
+# Round-trips the swift-build-cache-restore / swift-build-cache-save actions
+# through the org's S3 cache bucket: restore (miss) -> save -> restore (hit),
+# then checks the saved content came back. A second job runs the restore
+# action without id-token: write and expects the clear OIDC error.
+#
+# Needs the org Actions variable CI_CACHE_ROLE_ARN to be visible to this repo;
+# the jobs hand it to the actions as an environment variable.
+# Pull requests from forks get no OIDC token, so the jobs are skipped for them.
+
+on:
+  pull_request:
+    paths:
+      - 'swift-build-cache-restore/**'
+      - 'swift-build-cache-save/**'
+      - '.github/workflows/test-swift-build-cache.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: test-swift-build-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  roundtrip:
+    name: Restore, save, restore
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJson(vars.RUNNER_LINUX || '["ubuntu-latest"]') }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}
+      # Unique per run so the first restore is always a miss.
+      KEY_PREFIX: cachetest-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore (expect miss)
+        id: first
+        uses: ./swift-build-cache-restore
+        with:
+          path: cachetest-dir
+          key-prefix: ${{ env.KEY_PREFIX }}
+
+      - name: Assert first restore missed
+        run: |
+          if [ "${{ steps.first.outputs.cache-hit }}" = "true" ]; then
+            echo "::error::first restore unexpectedly hit"; exit 1
+          fi
+
+      - name: Create content to cache
+        run: |
+          mkdir -p cachetest-dir
+          echo "payload-${{ github.run_id }}" > cachetest-dir/payload.txt
+          head -c 5000000 /dev/urandom > cachetest-dir/blob.bin
+          sha256sum cachetest-dir/blob.bin > blob.sha256
+
+      - name: Save
+        uses: ./swift-build-cache-save
+        with:
+          path: cachetest-dir
+          key-prefix: ${{ env.KEY_PREFIX }}
+          fix-docker-permissions: 'false'
+
+      - name: Remove local copy
+        run: rm -rf cachetest-dir
+
+      - name: Restore (expect hit)
+        id: second
+        uses: ./swift-build-cache-restore
+        with:
+          path: cachetest-dir
+          key-prefix: ${{ env.KEY_PREFIX }}
+
+      - name: Assert second restore hit and content matches
+        run: |
+          if [ "${{ steps.second.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::second restore did not hit (cache-hit='${{ steps.second.outputs.cache-hit }}')"; exit 1
+          fi
+          test "$(cat cachetest-dir/payload.txt)" = "payload-${{ github.run_id }}"
+          sha256sum -c blob.sha256
+
+  no-oidc:
+    name: Clear error without id-token
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJson(vars.RUNNER_LINUX || '["ubuntu-latest"]') }}
+    permissions:
+      contents: read
+    env:
+      CI_CACHE_ROLE_ARN: ${{ vars.CI_CACHE_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Restore without id-token (expect failure)
+        id: restore
+        continue-on-error: true
+        uses: ./swift-build-cache-restore
+        with:
+          path: cachetest-dir
+          key-prefix: cachetest-nooidc
+
+      - name: Assert the restore failed
+        run: |
+          if [ "${{ steps.restore.outcome }}" != "failure" ]; then
+            echo "::error::restore without id-token: write should fail, got '${{ steps.restore.outcome }}'"; exit 1
+          fi
+
+  # The no-oidc job above only proves the restore step failed. This job reads
+  # that job's log and checks it failed with the OIDC message, not for some
+  # other reason (a failure to load the action would also look green).
+  no-oidc-reason:
+    name: Failure was the OIDC error
+    needs: no-oidc
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJson(vars.RUNNER_LINUX || '["ubuntu-latest"]') }}
+    permissions:
+      actions: read
+    steps:
+      - name: Check the log of the no-oidc job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jobs=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100")
+          id=$(echo "$jobs" | jq -r '.jobs[] | select(.name == "Clear error without id-token") | .id')
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" > nooidc.log
+          grep -q "needs a GitHub OIDC token" nooidc.log || { echo "::error::no-oidc job did not fail with the OIDC message"; exit 1; }
+          echo "no-oidc job failed with the expected OIDC message"

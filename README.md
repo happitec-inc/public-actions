@@ -8,8 +8,8 @@ The workflows here are designed for public consumption: any external caller can 
 
 | Action | Purpose |
 |---|---|
-| [`swift-build-cache-restore`](swift-build-cache-restore/action.yml) | Restore a cached `.build` directory for Swift projects. `uses: happitec-inc/public-actions/swift-build-cache-restore@main` |
-| [`swift-build-cache-save`](swift-build-cache-save/action.yml) | Save the `.build` directory after a Swift build, with Docker permission fix. `uses: happitec-inc/public-actions/swift-build-cache-save@main` |
+| [`swift-build-cache-restore`](swift-build-cache-restore/action.yml) | Restore a cached `.build` directory for Swift projects from the org's S3 cache bucket. `uses: happitec-inc/public-actions/swift-build-cache-restore@main` |
+| [`swift-build-cache-save`](swift-build-cache-save/action.yml) | Save the `.build` directory to the org's S3 cache bucket after a Swift build, with Docker permission fix. `uses: happitec-inc/public-actions/swift-build-cache-save@main` |
 
 ## Workflows
 
@@ -17,6 +17,8 @@ The workflows here are designed for public consumption: any external caller can 
 |---|---|
 | [`.github/workflows/swift-test.yml`](.github/workflows/swift-test.yml) | Build and test a Swift package or Xcode project on macOS (SPM, `xcodebuild test`, multi-target app builds). |
 | [`.github/workflows/deploy-docc.yml`](.github/workflows/deploy-docc.yml) | Build Swift DocC documentation and publish to GitHub Pages. |
+
+The two `swift-build-cache-*` actions authenticate to the cache bucket with GitHub OIDC. The calling job must grant `permissions: id-token: write`, and pass the cache role through the environment, because composite actions cannot read `vars` themselves: `env: { CI_CACHE_ROLE_ARN: "${{ vars.CI_CACHE_ROLE_ARN }}" }` on the job, with `CI_CACHE_ROLE_ARN` defined as an org Actions variable visible to the repository. Pull requests from forks get no OIDC token, so skip the cache steps for them (`if: github.event.pull_request.head.repo.fork != true`); the actions fail with an explicit error rather than falling back to GitHub's cache.
 
 Each workflow's own header comment carries detailed input/secret reference and example callers — start there.
 

@@ -4,6 +4,13 @@ description: |
   when the build ran inside Docker (files owned by root), then saves
   the cache. Runs even if later steps fail (if: always()).
 
+  The cache lives in the org's S3 cache bucket (via runs-on/cache), not in
+  GitHub's cache. The calling job must grant `permissions: id-token: write`,
+  set the CI_CACHE_ROLE_ARN environment variable from the org Actions
+  variable of the same name (composite actions cannot read the vars
+  context), and must not run this action for fork pull requests, which get
+  no OIDC token. Every key is prefixed with the calling repository's name.
+
 inputs:
   path:
     description: Path to cache (relative to workspace root)
@@ -29,9 +36,41 @@ runs:
           sudo chown -R $(id -u):$(id -g) "${{ inputs.path }}"
         fi
 
-    - name: Save Swift build cache
+    - name: Require an OIDC token and the cache role variable
+      id: oidc
       if: always()
-      uses: actions/cache/save@v5
+      shell: bash
+      env:
+        CACHE_ROLE_ARN: ${{ env.CI_CACHE_ROLE_ARN }}
+      run: |
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error title=No OIDC token::This action stores the build cache in the org's S3 cache bucket and needs a GitHub OIDC token. The calling job must grant 'permissions: id-token: write'. Pull requests from forks never receive an OIDC token, so the calling workflow must skip the cache steps for fork pull requests (for example: if: github.event.pull_request.head.repo.fork != true). There is no fallback to GitHub's cache."
+          exit 1
+        fi
+        if [ -z "$CACHE_ROLE_ARN" ]; then
+          echo "::error title=CI_CACHE_ROLE_ARN empty::The environment variable CI_CACHE_ROLE_ARN (the cache role to assume) is empty. Set it on the calling job or workflow from the org Actions variable of the same name, which must be defined and visible to this repository."
+          exit 1
+        fi
+
+    - name: Assume the cache role
+      id: aws
+      if: always() && steps.oidc.outcome == 'success'
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: ${{ env.CI_CACHE_ROLE_ARN }}
+        aws-region: us-east-1
+        output-credentials: true
+        output-env-credentials: false
+
+    - name: Save Swift build cache
+      if: always() && steps.aws.outcome == 'success'
+      uses: runs-on/cache/save@88d90644011a3a9957fd141a106f5a94f9794203 # v5.0.7
+      env:
+        RUNS_ON_S3_BUCKET_CACHE: happitec-ci-cache
+        AWS_REGION: us-east-1
+        AWS_ACCESS_KEY_ID: ${{ steps.aws.outputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ steps.aws.outputs.aws-secret-access-key }}
+        AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
       with:
         path: ${{ inputs.path }}
-        key: ${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
+        key: ${{ github.repository }}/${{ inputs.key-prefix }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
