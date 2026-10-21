@@ -1,0 +1,264 @@
+name: Bump Policy
+description: >-
+  Validate that a Homebrew tap PR is exactly a bump — one formula or one cask —
+  and that its payload
+  matches what the source repo actually published. Delivered as a COMPOSITE
+  ACTION so the driver ships with the action: GitHub fetches the action's whole
+  directory, so the tap needs no contents-checkout of this repo and no token to
+  go and get the driver separately.
+
+# WHY THIS EXISTS
+#
+# The usual auto-merge gate on a tap keys on branch prefix plus PR author —
+# "the release bot opened a PR on a bump/* branch". Identity is not evidence:
+# every automated author shares one bot identity, so that gate proves only that
+# a machine opened the PR, not that the diff is a bump. This action reads the
+# diff instead, and verifies the new pin against the source repo.
+#
+# THREE VERDICTS. The driver emits pass / abstain / fail:
+#
+#   pass     exit 0, and — if `review-token` is supplied — an approving review
+#            is posted so the branch's review requirement is met without
+#            `gh pr merge --admin`.
+#   abstain  exit 0, SILENT. Not a pure bump (new formula or cask, new tap, strategy
+#            change, extra content). No approval, so the missing review still
+#            blocks the merge and a reviewer supplies it.
+#   fail     exit 2. Bump-shaped, payload assertion false. Hard block.
+#
+# Collapsing abstain into fail is the mistake this design exists to avoid: it
+# would make a new-formula PR fail a REQUIRED check and become unmergeable,
+# walling off exactly the class of change that is supposed to get eyes on it.
+#
+# The approving review is gated on `approve` in the driver's result JSON, which
+# is true ONLY when payload verification actually ran and succeeded. It is never
+# inferred from a green exit, because a green exit covers abstain too — and
+# because a SKIPPED job reports its check as satisfied to branch protection.
+# For the same reason the CALLER's workflow must keep its trigger unfiltered:
+# no `if:` on branch name or author. An approval must come from an affirmative
+# attestation, never from the absence of a failure.
+#
+# The CALLER sets runs-on (this action runs inside the caller's job).
+#
+# Required caller job permissions:
+#   permissions:
+#     contents: read        # actions/checkout of the tap
+#     pull-requests: read   # read the allow-downgrade label
+#   (pull-requests: write is NOT needed — the approval is posted with the
+#    separate `review-token`, not with GITHUB_TOKEN. GitHub also refuses to let
+#    a PR's own author approve it, which is why the review identity has to be
+#    a different App from the one that opens bump PRs.)
+#
+# The `token` input must be able to READ THE SOURCE REPO, which is a different
+# repo from the tap — the default GITHUB_TOKEN cannot. Pass a GitHub App
+# installation token with `contents: read` across the org that owns the source
+# repos.
+
+inputs:
+  token:
+    description: >-
+      Token used to resolve the pinned tag / release asset on the SOURCE repo.
+      Must carry contents: read on every repo a formula in this tap can point
+      at — a GitHub App installation token, org-wide. NOT the default
+      GITHUB_TOKEN, which is scoped to the tap only.
+    required: true
+  allow-downgrade:
+    description: >-
+      Permit a backwards version bump. Normally driven by the presence of the
+      `allow-downgrade` label on the PR rather than hardcoded.
+    required: false
+    default: ''
+  review-token:
+    description: >-
+      OPTIONAL. Token used to POST the mechanical approving review on a PASS.
+
+      Pass a token for a GitHub App whose approvals actually satisfy
+      `required_approving_review_count` on the tap's protected branch. That is
+      a MEASURED property, not an assumed one: in the org this gate was built
+      for, two separate PRs each merged with that App's APPROVED as the only
+      review on the PR, reviewDecision APPROVED, and no App listed in
+      `bypass_pull_request_allowances`.
+
+      Which single permission makes an App's approval count is NOT established.
+      No negative control has been run — nobody has posted an approval from an
+      App lacking a candidate permission and watched the count fail to move. So
+      do not read that receipt as "pull-requests: write is the operative
+      permission" and mint a narrower token on the strength of it.
+
+      The identity must also not be the PR's author: GitHub refuses self-review,
+      and bump PRs are opened by the release bot. That is why the reviewing
+      identity has to be a separate App from the one that opens the bumps.
+
+      Omit it and the action is a pure check: it still classifies the PR and
+      still fails on a false payload, it just never approves anything. That is
+      the right setting for any caller that wants the gate without wiring it
+      into branch protection.
+    required: false
+    default: ''
+  fetch-depth:
+    description: >-
+      Checkout depth for the tap. Must reach the PR's merge base; 0 (full) is
+      the safe default and these repos are tiny.
+    required: false
+    default: '0'
+
+outputs:
+  verdict:
+    description: 'pass | abstain | fail'
+    value: ${{ steps.policy.outputs.verdict }}
+  approve:
+    description: >-
+      'true' only when the payload was verified and the PR is a pure bump. The
+      approving review is gated on this, never on the step's exit status.
+    value: ${{ steps.policy.outputs.approve }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out the tap
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: ${{ inputs.fetch-depth }}
+        # Check out the PR head, not the merge commit: the gate compares the
+        # base branch against what the author actually wrote. A merge commit
+        # would fold in unrelated base movement and mask the real diff.
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Resolve base and head
+      id: refs
+      shell: bash
+      env:
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+        # Compare against the MERGE BASE, not the base branch tip. If the base
+        # moved after the PR opened, diffing against the tip would attribute
+        # other people's commits to this PR and fail a clean bump.
+        MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
+        echo "base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+        echo "head=$HEAD_SHA"   >> "$GITHUB_OUTPUT"
+        echo "Comparing $MERGE_BASE..$HEAD_SHA"
+
+    - name: Read allow-downgrade label
+      id: label
+      shell: bash
+      env:
+        LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        OVERRIDE: ${{ inputs.allow-downgrade }}
+      run: |
+        set -euo pipefail
+        if [ -n "$OVERRIDE" ]; then
+          echo "allow=$OVERRIDE" >> "$GITHUB_OUTPUT"
+          echo "allow-downgrade forced by input: $OVERRIDE"
+          exit 0
+        fi
+        if printf '%s' "$LABELS" | grep -q '"allow-downgrade"'; then
+          echo "allow=true" >> "$GITHUB_OUTPUT"
+          echo "::warning::allow-downgrade label present — a backwards bump will be permitted"
+        else
+          echo "allow=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Run bump policy
+      id: policy
+      shell: bash
+      env:
+        # github.action_path must be referenced via env in composite actions
+        # (per GitHub docs: "Do not use in the run keyword"). It points at this
+        # action's own directory inside the fetched checkout of this repo, and
+        # the driver is its SIBLING there — the action directory is the unit
+        # GitHub fetches, so shipping the driver inside it is what makes the
+        # action self-contained for a caller that never checks this repo out.
+        ACTION_PATH: ${{ github.action_path }}
+        WORKSPACE: ${{ github.workspace }}
+        BASE: ${{ steps.refs.outputs.base }}
+        HEAD: ${{ steps.refs.outputs.head }}
+        ALLOW: ${{ steps.label.outputs.allow }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        DRIVER="$ACTION_PATH/bump_policy.py"
+        RESULT="${RUNNER_TEMP:-/tmp}/bump-policy-result.json"
+        ARGS=(--repo-dir "$WORKSPACE" --base-sha "$BASE" --head-sha "$HEAD"
+              --result-json "$RESULT")
+        [ "$ALLOW" = "true" ] && ARGS+=(--allow-downgrade)
+
+        set +e
+        python3 "$DRIVER" "${ARGS[@]}"
+        CODE=$?
+        set -e
+
+        # Read the verdict back out of the driver's own result file rather than
+        # inferring it from CODE: exit 0 covers PASS and ABSTAIN alike, and only
+        # one of those two may approve. If the driver crashed before writing the
+        # file, this line fails the step — which is the safe direction, because a
+        # step that fails posts nothing.
+        python3 - "$RESULT" <<'PY' >> "$GITHUB_OUTPUT"
+        import json, sys
+        r = json.load(open(sys.argv[1], encoding="utf-8"))
+        print(f"verdict={r['verdict']}")
+        print("approve=" + ("true" if r["approve"] else "false"))
+        print(f"result-json={sys.argv[1]}")
+        PY
+
+        exit $CODE
+
+    # Posted only on an affirmative attestation that the payload verified, and
+    # only when the caller supplied a review identity. A FAIL fails the step
+    # above, so this one never runs; an ABSTAIN reaches it with approve=false.
+    #
+    # THIS STEP IS THE SECURITY BOUNDARY of the whole action: it is where a
+    # wrong `if:` turns into a spurious approval on content nobody read. The
+    # driver's mutation-based negative control mutates the Python only, so
+    # nothing in this step is covered by a mutation — it is verified by reading,
+    # not by measurement.
+    #
+    # No idempotency guard on purpose: re-approving is harmless (GitHub keeps
+    # one active review per reviewer), and it is REQUIRED under
+    # dismiss_stale_reviews — a new push dismisses the old approval, and a
+    # `synchronize` re-run has to be able to post a fresh one against the new
+    # head.
+    - name: Post mechanical bump approval
+      if: steps.policy.outputs.approve == 'true' && inputs.review-token != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.review-token }}
+        RESULT: ${{ steps.policy.outputs.result-json }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        # The SHA the driver was actually handed, carried through from the refs
+        # step — NOT a re-read of github.event.pull_request.head.sha, which is
+        # the same value today but stops being the verified one the moment
+        # anything upstream resolves the head differently.
+        VERIFIED_SHA: ${{ steps.refs.outputs.head }}
+      run: |
+        set -euo pipefail
+        BODY="${RUNNER_TEMP:-/tmp}/bump-policy-approval.md"
+        python3 - "$RESULT" "$BODY" <<'PY'
+        import json, sys
+        r = json.load(open(sys.argv[1], encoding="utf-8"))
+        body = r["approval_body"]
+        if not body.strip():
+            sys.exit("result json carries no approval body — refusing to approve")
+        open(sys.argv[2], "w", encoding="utf-8").write(body)
+        PY
+
+        # POST the review through the API rather than `gh pr review --approve`,
+        # for one reason: `gh pr review` has no commit-pinning flag, and the REST
+        # default is "the most recent commit in the pull request" AT POST TIME.
+        # A push landing mid-run would therefore attach this approval to content
+        # the driver never verified — the same race a merge step pins with
+        # --match-head-commit, and it matters more here, because the approval is
+        # the thing that makes the merge legal.
+        #
+        # Pinning turns the race the safe way round: the review is
+        # stale-by-construction against the newer head and gets dismissed under
+        # dismiss_stale_reviews, instead of silently blessing the new commit.
+        gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+          -f commit_id="$VERIFIED_SHA" \
+          -f event=APPROVE \
+          -F body=@"$BODY" \
+          --jq '"review \(.id) posted, state \(.state), pinned to \(.commit_id)"'
+        echo "Approved $REPO#$PR_NUMBER at $VERIFIED_SHA"
